@@ -1,0 +1,49 @@
+# deps
+node_modules/
+.pnpm-store/
+.yarn/cache
+.yarn/install-state.gz
+*-debug.log*
+lerna-debug.log*
+
+# build / cache
+dist/
+build/
+out/
+lib/
+*.tsbuildinfo
+.eslintcache
+.cache/
+.parcel-cache/
+.vite/
+.turbo/
+
+# test
+coverage/
+.nyc_output/
+*.lcov
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# logs
+logs/
+*.log
+
+# editor / IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.history/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
