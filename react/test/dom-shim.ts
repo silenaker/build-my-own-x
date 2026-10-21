@@ -14,6 +14,11 @@ export class TestNode {
     this.nodeType = nodeType;
   }
   appendChild<T extends TestNode>(child: T): T {
+    if (child instanceof TestFragment) {
+      // As in the DOM, appending a fragment moves its children, not the fragment.
+      for (const grandchild of child.childNodes.slice()) this.appendChild(grandchild);
+      return child;
+    }
     if (child.parentNode !== null) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.childNodes.push(child);
@@ -90,6 +95,19 @@ export class TestDocument {
   }
   createTextNode(text: string): TestText {
     return new TestText(text);
+  }
+  createDocumentFragment(): TestFragment {
+    return new TestFragment();
+  }
+}
+
+/** A detached container; `appendChild` on a parent moves its children out. */
+export class TestFragment extends TestNode {
+  constructor() {
+    super(11);
+  }
+  get textContent(): string {
+    return this.childNodes.map(textOf).join("");
   }
 }
 

@@ -5,11 +5,14 @@ import {
   REACT_SUSPENSE_TYPE,
   createElement,
   lazy,
+  use,
+  useState,
 } from "../react.ts";
 import type { Any } from "../shared.ts";
 import { createRoot, renderToString } from "../react-dom.ts";
 import { asElement, mount, TestDocument, TestText } from "./dom-shim.ts";
 import { deepAwait } from "../react-flight-client.ts";
+import { until } from "./helpers.ts";
 
 describe("leaves", () => {
   it("renders nothing for null, undefined and booleans", () => {
@@ -280,6 +283,257 @@ describe("lazy", () => {
 
     renderToString(tree);
     expect(loads).toBe(1);
+  });
+});
+
+describe("suspense", () => {
+  const never = new Promise<never>(() => {});
+
+  /** Throws the same pending thenable on every read. */
+  function Suspends() {
+    use(never);
+    return createElement("b", { children: "unreachable" });
+  }
+
+  it("renders the fallback instead of the suspended children", () => {
+    expect(
+      renderToString(
+        createElement(REACT_SUSPENSE_TYPE, {
+          fallback: createElement("p", { children: "loading" }),
+          children: createElement(Suspends, {}),
+        }),
+      ),
+    ).toBe("<p>loading</p>");
+  });
+
+  it("drops the output produced before the suspension", () => {
+    expect(
+      renderToString(
+        createElement(REACT_SUSPENSE_TYPE, {
+          fallback: "loading",
+          children: createElement("div", {
+            children: [
+              createElement("span", { children: "partial" }),
+              createElement(Suspends, {}),
+            ],
+          }),
+        }),
+      ),
+    ).toBe("loading");
+  });
+
+  it("lets the nearest boundary handle the suspension", () => {
+    expect(
+      renderToString(
+        createElement(REACT_SUSPENSE_TYPE, {
+          fallback: "outer",
+          children: createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "inner",
+            children: createElement(Suspends, {}),
+          }),
+        }),
+      ),
+    ).toBe("inner");
+  });
+
+  it("keeps a ready sibling of a suspended boundary", () => {
+    expect(
+      renderToString(
+        createElement("div", {
+          children: [
+            createElement("span", { children: "ready" }),
+            createElement(REACT_SUSPENSE_TYPE, {
+              fallback: "wait",
+              children: createElement(Suspends, {}),
+            }),
+          ],
+        }),
+      ),
+    ).toBe("<div><span>ready</span>wait</div>");
+  });
+
+  it("explains a suspension with no boundary", () => {
+    expect(() => renderToString(createElement(Suspends, {}))).toThrow("no <Suspense> boundary");
+  });
+
+  it("shows the fallback, then the content once the thenable settles", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+
+    function Child() {
+      return createElement("b", { children: use(pending) });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: createElement("p", { children: "loading" }),
+        children: createElement(Child, {}),
+      }),
+    );
+    expect(container.textContent).toBe("loading");
+
+    settle("ready");
+    await until(() => container.textContent === "ready");
+    expect(asElement(container.childNodes[0]).tagName).toBe("b");
+  });
+
+  it("never commits the partial content of a suspended boundary", () => {
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement("div", {
+          children: ["partial", createElement(Suspends, {})],
+        }),
+      }),
+    );
+    expect(container.childNodes).toHaveLength(1);
+    expect(container.textContent).toBe("loading");
+  });
+
+  it("retries sibling boundaries independently and keeps their order", async () => {
+    let settleA!: (value: string) => void;
+    let settleB!: (value: string) => void;
+    const a = new Promise<string>((resolve) => (settleA = resolve));
+    const b = new Promise<string>((resolve) => (settleB = resolve));
+
+    function Show({ value, label }: { value: Promise<string>; label: string }) {
+      return createElement("b", { children: label + use(value) });
+    }
+
+    const container = mount(
+      createElement("div", {
+        children: [
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "wait-a",
+            children: createElement(Show, { value: a, label: "a:" }),
+          }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "wait-b",
+            children: createElement(Show, { value: b, label: "b:" }),
+          }),
+        ],
+      }),
+    );
+    expect(container.textContent).toBe("wait-await-b");
+
+    settleA("1");
+    await until(() => container.textContent === "a:1wait-b");
+
+    settleB("2");
+    await until(() => container.textContent === "a:1b:2");
+  });
+
+  it("waits for a lazy component and renders it once loaded", async () => {
+    let settle!: (exports: { default: Any }) => void;
+    const loaded = new Promise<{ default: Any }>((resolve) => (settle = resolve));
+    const Widget = lazy(() => loaded);
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement(Widget, {}),
+      }),
+    );
+    expect(container.textContent).toBe("loading");
+
+    settle({ default: () => createElement("b", { children: "lazy" }) });
+    await until(() => container.textContent === "lazy");
+    expect(asElement(container.childNodes[0]).tagName).toBe("b");
+  });
+
+  it("keeps a mounted component's state while an update suspends", async () => {
+    let pending: Promise<void> | null = null;
+    let settle!: () => void;
+    let suspend = false;
+
+    function Child() {
+      const [count, setCount] = useState(0);
+      if (suspend) {
+        const wait = (pending ??= new Promise<void>((resolve) => (settle = resolve)));
+        use(wait);
+      }
+      return createElement("button", {
+        onClick: () => {
+          suspend = true;
+          setCount(count + 1);
+        },
+        children: "count:" + count,
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: createElement("p", { children: "loading" }),
+        children: createElement(Child, {}),
+      }),
+    );
+    expect(container.textContent).toBe("count:0");
+
+    asElement(container.childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("loading");
+
+    settle();
+    await until(() => container.textContent === "count:1");
+  });
+
+  it("keeps the state of content the suspended attempt never reached", async () => {
+    let settle!: () => void;
+    let pending: Promise<void> | null = null;
+    let suspend = false;
+
+    function Slow() {
+      if (suspend) {
+        const wait = (pending ??= new Promise<void>((resolve) => (settle = resolve)));
+        use(wait);
+      }
+      return null;
+    }
+
+    function Counter() {
+      const [count, setCount] = useState(0);
+      return createElement("span", {
+        onClick: () => setCount(count + 1),
+        children: "count:" + count,
+      });
+    }
+
+    function App() {
+      const [, setArmed] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", {
+            onClick: () => {
+              suspend = true;
+              setArmed(true);
+            },
+            children: "arm",
+          }),
+          createElement(Slow, {}),
+          createElement(Counter, {}),
+        ],
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement(App, {}),
+      }),
+    );
+    const div = () => asElement(container.childNodes[0]);
+    const arm = () => asElement(div().childNodes[0]);
+    const counter = () => asElement(div().childNodes[1]);
+
+    counter().dispatch("click", {});
+    counter().dispatch("click", {});
+    expect(container.textContent).toBe("armcount:2");
+
+    // Slow suspends before Counter is reached, so this pass never touches it.
+    arm().dispatch("click", {});
+    expect(container.textContent).toBe("loading");
+
+    settle();
+    await until(() => container.textContent === "armcount:2");
   });
 });
 

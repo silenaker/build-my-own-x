@@ -9,7 +9,7 @@ import {
   type Dispatcher,
   type LazyWrapper,
 } from "./react.ts";
-import { isThenable, type Any } from "./shared.ts";
+import { isThenable, type Any, type Thenable } from "./shared.ts";
 
 interface NormalizedProperties {
   /** `[attributeName, value]`, already stringified. */
@@ -28,6 +28,10 @@ interface HostConfig<Root, Instance> {
   appendChild(parent: Root | Instance, child: Instance): void;
   setInitialProperties(instance: Instance, properties: NormalizedProperties): void;
   setInnerHTML(instance: Instance, html: string): void;
+  /** A detached parent, so a boundary keeps its output out of the tree until it is whole. */
+  createStagingRoot(): Root | Instance;
+  /** Move everything staged into `parent`. */
+  commitStaged(parent: Root | Instance, staged: Root | Instance): void;
 }
 
 // ---- Component instances and the hook dispatcher ---------------------------
@@ -181,14 +185,35 @@ const noop = (): void => {};
 
 // ---- The element walker ----------------------------------------------------
 
+/**
+ * Component identity is positional, and a scope names one position. The
+ * content and the fallback of a boundary need separate scopes: a boundary
+ * that settles must not hand its hooks to the UI it replaces.
+ */
+interface RenderScope {
+  /** Stable across passes; prefixes every instance key inside the scope. */
+  key: string;
+  /** Ordinal of the next component in this scope. */
+  componentIndex: number;
+  /** Ordinal of the next Suspense boundary in this scope. */
+  boundaryIndex: number;
+}
+
 interface RenderContext<Root, Instance> {
   host: HostConfig<Root, Instance>;
-  /** Component instances reused by render ordinal. */
-  instances: Map<number, ComponentInstance>;
-  /** Ordinal cursor, reset at the start of every pass. */
-  componentIndex: number;
+  /** Component instances by scope key and ordinal. */
+  instances: Map<string, ComponentInstance>;
+  /** Instance keys reached in this pass, including an attempt that suspended. */
+  rendered: Set<string>;
+  /** Where component and boundary ordinals are handed out right now. */
+  scope: RenderScope;
   /** Re-render the root (a no-op for the HTML target). */
   rerender: () => void;
+  /**
+   * A boundary is waiting on this thenable. The DOM root retries once it
+   * settles; the HTML target cannot wait, so it keeps the fallback.
+   */
+  onSuspend: (thenable: Thenable) => void;
 }
 
 function renderPass<Root, Instance>(
@@ -196,16 +221,31 @@ function renderPass<Root, Instance>(
   element: Any,
   parent: Root | Instance,
 ): void {
-  context.componentIndex = 0;
-  renderNode(element, context, parent);
-  // Any instance past the last ordinal was not rendered in this pass: drop it.
+  context.scope = { key: "root", componentIndex: 0, boundaryIndex: 0 };
+  context.rendered.clear();
+  try {
+    renderNode(element, context, parent);
+  } catch (thrown) {
+    // No enclosing boundary can show a fallback, so the tree has to be settled
+    // before it is rendered again.
+    if (isThenable(thrown)) {
+      throw new Error(
+        "A component suspended while rendering synchronously, but no <Suspense> boundary " +
+          "was found. Await the tree first (e.g. `await deepAwait(root)`) before rendering it.",
+      );
+    }
+    throw thrown;
+  }
+  // A component missing from this pass was removed, so its hooks must not leak
+  // into whichever component later takes the same position.
   for (const key of context.instances.keys()) {
-    if (key >= context.componentIndex) context.instances.delete(key);
+    if (!context.rendered.has(key)) context.instances.delete(key);
   }
 }
 
 function getInstance<Root, Instance>(context: RenderContext<Root, Instance>): ComponentInstance {
-  const key = context.componentIndex++;
+  const key = context.scope.key + "/" + context.scope.componentIndex++;
+  context.rendered.add(key);
   let instance = context.instances.get(key);
   if (instance === undefined) {
     instance = { hooks: [], hookIndex: 0, rerender: context.rerender };
@@ -267,8 +307,12 @@ function renderElement<Root, Instance>(
     type = resolveLazy(type);
   }
 
-  if (type === REACT_FRAGMENT_TYPE || type === REACT_SUSPENSE_TYPE) {
+  if (type === REACT_FRAGMENT_TYPE) {
     renderNode(props.children, context, parent);
+    return;
+  }
+  if (type === REACT_SUSPENSE_TYPE) {
+    renderSuspense(props, context, parent);
     return;
   }
   if (typeof type === "string") {
@@ -340,6 +384,51 @@ function renderComponent<Root, Instance>(
   }
 
   renderNode(output, context, parent);
+}
+
+/**
+ * Children render into a staging root, so a subtree that suspends halfway
+ * leaves no trace. The fallback takes its place until the root is retried.
+ */
+function renderSuspense<Root, Instance>(
+  props: Any,
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+): void {
+  const outer = context.scope;
+  const boundaryKey = outer.key + "/b" + outer.boundaryIndex++;
+  const staged = context.host.createStagingRoot();
+
+  context.scope = { key: boundaryKey + ":content", componentIndex: 0, boundaryIndex: 0 };
+  try {
+    renderNode(props.children, context, staged);
+    context.host.commitStaged(parent, staged);
+  } catch (thrown) {
+    if (!isThenable(thrown)) throw thrown;
+
+    // The attempt never committed, but the retry enters at the same keys and
+    // should find the hooks it already mounted.
+    retainScope(context, context.scope.key);
+    context.onSuspend(thrown);
+
+    const fallbackStage = context.host.createStagingRoot();
+    context.scope = { key: boundaryKey + ":fallback", componentIndex: 0, boundaryIndex: 0 };
+    renderNode(props.fallback, context, fallbackStage);
+    context.host.commitStaged(parent, fallbackStage);
+  } finally {
+    context.scope = outer;
+  }
+}
+
+/** Keep every instance mounted before an attempt that suspended, so the retry reuses it. */
+function retainScope<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  scopeKey: string,
+): void {
+  const prefix = scopeKey + "/";
+  for (const key of context.instances.keys()) {
+    if (key.startsWith(prefix)) context.rendered.add(key);
+  }
 }
 
 // ---- Prop normalization ----------------------------------------------------
@@ -502,17 +591,8 @@ function resolveLazy(lazy: LazyWrapper): Any {
   if (typeof lazy._init !== "function") {
     throw new Error("Invalid lazy element type: missing `_init`.");
   }
-  try {
-    return lazy._init();
-  } catch (thrown) {
-    if (isThenable(thrown)) {
-      throw new Error(
-        "A lazy component suspended while rendering synchronously. Await the tree first " +
-          "(e.g. `await deepAwait(root)`) before rendering it.",
-      );
-    }
-    throw thrown;
-  }
+  // A pending `_init` throws its thenable: the nearest boundary has to see it.
+  return lazy._init();
 }
 
 /** A short human-readable description, for error messages. */
@@ -581,6 +661,13 @@ const htmlHost: HostConfig<HtmlRoot, HtmlNode> = {
   setInnerHTML: (instance, html) => {
     if (instance.kind === "element") instance.innerHTML = html;
   },
+  createStagingRoot: () => ({ kind: "root", children: [] }),
+  commitStaged: (parent, staged) => {
+    if ((parent.kind === "root" || parent.kind === "element") && staged.kind === "root") {
+      for (const child of staged.children) parent.children.push(child);
+      staged.children.length = 0;
+    }
+  },
 };
 
 /** Elements that must not have a closing tag. */
@@ -633,8 +720,10 @@ export function renderToString(element: Any): string {
   const context: RenderContext<HtmlRoot, HtmlNode> = {
     host: htmlHost,
     instances: new Map(),
-    componentIndex: 0,
+    rendered: new Set(),
+    scope: { key: "root", componentIndex: 0, boundaryIndex: 0 },
     rerender: noop,
+    onSuspend: noop,
   };
   const root = context.host.createRoot();
   renderPass(context, element, root);
@@ -667,6 +756,10 @@ function createDomHost(document: Document, container: Element): HostConfig<Eleme
     setInnerHTML: (instance, html) => {
       (instance as Element).innerHTML = html;
     },
+    createStagingRoot: () => document.createDocumentFragment(),
+    commitStaged: (parent, staged) => {
+      (parent as Node).appendChild(staged as Node);
+    },
   };
 }
 
@@ -684,17 +777,33 @@ export function createRoot(container: Element): ReactDomRoot {
     throw new Error("createRoot() requires a container that belongs to a document.");
   }
 
-  const context: RenderContext<Element, Node> = {
-    host: createDomHost(document, container),
-    instances: new Map(),
-    componentIndex: 0,
-    rerender: () => rerender(),
-  };
+  /** Thenables a boundary is waiting on, so a settlement retries the root once. */
+  const waiting = new Set<Thenable>();
 
   let rootElement: Any = null;
   let mounted = false;
   let rendering = false;
   let needsRerender = false;
+
+  const context: RenderContext<Element, Node> = {
+    host: createDomHost(document, container),
+    instances: new Map(),
+    rendered: new Set(),
+    scope: { key: "root", componentIndex: 0, boundaryIndex: 0 },
+    rerender: () => rerender(),
+    onSuspend: retryWhenSettled,
+  };
+
+  function retryWhenSettled(thenable: Thenable): void {
+    if (waiting.has(thenable)) return;
+    waiting.add(thenable);
+    const retry = (): void => {
+      waiting.delete(thenable);
+      rerender();
+    };
+    // A rejection retries too: `use()` throws the reason on the next pass.
+    thenable.then(retry, retry);
+  }
 
   function rerender(): void {
     if (!mounted) return;
@@ -723,6 +832,8 @@ export function createRoot(container: Element): ReactDomRoot {
     unmount(): void {
       clearChildren(container);
       context.instances.clear();
+      context.rendered.clear();
+      waiting.clear();
       mounted = false;
       rootElement = null;
     },
