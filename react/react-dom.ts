@@ -57,9 +57,16 @@ interface ComponentInstance {
   hookIndex: number;
   /** Re-render the root. */
   rerender: () => void;
+  /** The component the hooks belong to; another one at the same slot mounts fresh. */
+  type: Any;
+  /** Distinguishes one mounted instance from the next one at the same slot. */
+  id: number;
 }
 
 let currentInstance: ComponentInstance | null = null;
+
+/** Identifies one mounted instance, so its output subtree keeps a stable scope. */
+let nextInstanceId = 0;
 
 function requireInstance(): ComponentInstance {
   if (currentInstance === null) {
@@ -186,26 +193,24 @@ const noop = (): void => {};
 // ---- The element walker ----------------------------------------------------
 
 /**
- * Component identity is positional, and a scope names one position. The
- * content and the fallback of a boundary need separate scopes: a boundary
- * that settles must not hand its hooks to the UI it replaces.
+ * One container the walker fills: the root, a host element, a component, or a
+ * boundary's content or fallback. The key is the path to that container, so a
+ * replaced ancestor renames the whole subtree and its instances go with it.
  */
 interface RenderScope {
-  /** Stable across passes; prefixes every instance key inside the scope. */
+  /** Path from the root to this container; prefixes every key below it. */
   key: string;
-  /** Ordinal of the next component in this scope. */
-  componentIndex: number;
-  /** Ordinal of the next Suspense boundary in this scope. */
-  boundaryIndex: number;
+  /** Ordinal of the next child here; every child consumes one. */
+  index: number;
 }
 
 interface RenderContext<Root, Instance> {
   host: HostConfig<Root, Instance>;
-  /** Component instances by scope key and ordinal. */
+  /** Component instances by their path from the root. */
   instances: Map<string, ComponentInstance>;
   /** Instance keys reached in this pass, including an attempt that suspended. */
   rendered: Set<string>;
-  /** Where component and boundary ordinals are handed out right now. */
+  /** The container being filled right now; its key prefixes every key inside it. */
   scope: RenderScope;
   /** Re-render the root (a no-op for the HTML target). */
   rerender: () => void;
@@ -221,7 +226,7 @@ function renderPass<Root, Instance>(
   element: Any,
   parent: Root | Instance,
 ): void {
-  context.scope = { key: "root", componentIndex: 0, boundaryIndex: 0 };
+  context.scope = { key: "root", index: 0 };
   context.rendered.clear();
   try {
     renderNode(element, context, parent);
@@ -236,19 +241,48 @@ function renderPass<Root, Instance>(
     }
     throw thrown;
   }
-  // A component missing from this pass was removed, so its hooks must not leak
-  // into whichever component later takes the same position.
+  // A component missing from this pass was unmounted, so its hooks must not
+  // leak into whichever component later occupies the same path.
   for (const key of context.instances.keys()) {
     if (!context.rendered.has(key)) context.instances.delete(key);
   }
 }
 
-function getInstance<Root, Instance>(context: RenderContext<Root, Instance>): ComponentInstance {
-  const key = context.scope.key + "/" + context.scope.componentIndex++;
+/** Run `render` with a fresh child scope named `key`. */
+function renderInScope<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  key: string,
+  render: () => void,
+): void {
+  const outer = context.scope;
+  context.scope = { key, index: 0 };
+  try {
+    render();
+  } finally {
+    context.scope = outer;
+  }
+}
+
+function getInstance<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  type: Any,
+  segment: string,
+): ComponentInstance {
+  const key = context.scope.key + "/" + segment;
   context.rendered.add(key);
   let instance = context.instances.get(key);
+  if (instance !== undefined && instance.type !== type) {
+    // Another component took this slot, so the old hooks cannot carry over.
+    instance = undefined;
+  }
   if (instance === undefined) {
-    instance = { hooks: [], hookIndex: 0, rerender: context.rerender };
+    instance = {
+      type,
+      id: nextInstanceId++,
+      hooks: [],
+      hookIndex: 0,
+      rerender: context.rerender,
+    };
     context.instances.set(key, instance);
   }
   return instance;
@@ -259,17 +293,30 @@ function renderNode<Root, Instance>(
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
-  if (value === null || value === undefined || typeof value === "boolean") return;
+  // A lazy wrapper can also appear as a child, not only as an element's `type`.
+  let node: Any = value;
+  while (isLazyWrapper(node)) {
+    node = resolveLazy(node);
+  }
 
-  switch (typeof value) {
+  // Arrays flatten into the parent, so they take no slot of their own.
+  if (Array.isArray(node)) {
+    for (const child of node) renderNode(child, context, parent);
+    return;
+  }
+
+  const index = context.scope.index++;
+  if (node === null || node === undefined || typeof node === "boolean") return;
+
+  switch (typeof node) {
     case "string":
-      context.host.appendChild(parent, context.host.createTextInstance(value));
+      context.host.appendChild(parent, context.host.createTextInstance(node));
       return;
     case "number":
-      context.host.appendChild(parent, context.host.createTextInstance("" + value));
+      context.host.appendChild(parent, context.host.createTextInstance("" + node));
       return;
     case "bigint":
-      context.host.appendChild(parent, context.host.createTextInstance(String(value)));
+      context.host.appendChild(parent, context.host.createTextInstance(String(node)));
       return;
     case "symbol":
       throw new Error("Symbols are not valid as a React child.");
@@ -277,25 +324,22 @@ function renderNode<Root, Instance>(
       throw new Error("Functions are not valid as a React child.");
   }
 
-  const node: Any = value;
-  if (Array.isArray(node)) {
-    for (const child of node) renderNode(child, context, parent);
-    return;
-  }
   if (node.$$typeof === REACT_ELEMENT_TYPE) {
-    renderElement(node, context, parent);
-    return;
-  }
-  if (isLazyWrapper(node)) {
-    // A lazy wrapper can also appear as a element, not only as an element's `type`.
-    renderNode(resolveLazy(node), context, parent);
+    renderElement(node, index, context, parent);
     return;
   }
   throw new Error("Objects are not valid as a React child (found: " + describe(node) + ").");
 }
 
+/** A child's identity among its siblings: its key, or its ordinal when unkeyed. */
+function childSegment(element: Any, index: number): string {
+  const key = element.key;
+  return key === null || key === undefined ? "#" + index : "$" + key;
+}
+
 function renderElement<Root, Instance>(
   element: Any,
+  index: number,
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
@@ -307,21 +351,26 @@ function renderElement<Root, Instance>(
     type = resolveLazy(type);
   }
 
+  const segment = childSegment(element, index);
+
   if (type === REACT_FRAGMENT_TYPE) {
-    renderNode(props.children, context, parent);
+    // A fragment is a level of its own, so its children are numbered inside it.
+    renderInScope(context, context.scope.key + "/Fragment" + segment, () => {
+      renderNode(props.children, context, parent);
+    });
     return;
   }
   if (type === REACT_SUSPENSE_TYPE) {
-    renderSuspense(props, context, parent);
+    renderSuspense(props, segment, context, parent);
     return;
   }
   if (typeof type === "string") {
-    renderHostElement(type, props, context, parent);
+    renderHostElement(type, props, segment, context, parent);
     return;
   }
 
   if (typeof type === "function") {
-    renderComponent(type, props, context, parent);
+    renderComponent(type, props, segment, context, parent);
     return;
   }
   throw new Error(
@@ -334,18 +383,22 @@ function renderElement<Root, Instance>(
 function renderHostElement<Root, Instance>(
   tag: string,
   props: Any,
+  segment: string,
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
   const instance = context.host.createInstance(tag);
   const properties = normalizeProperties(props);
 
-  if (properties.innerHTML !== null) {
-    // `dangerouslySetInnerHTML` wins over children.
-    context.host.setInnerHTML(instance, properties.innerHTML);
-  } else {
-    renderNode(props.children, context, instance);
-  }
+  // The tag is part of the path, so replacing this element remounts its children.
+  renderInScope(context, context.scope.key + "/" + tag + segment, () => {
+    if (properties.innerHTML !== null) {
+      // `dangerouslySetInnerHTML` wins over children.
+      context.host.setInnerHTML(instance, properties.innerHTML);
+    } else {
+      renderNode(props.children, context, instance);
+    }
+  });
 
   context.host.setInitialProperties(instance, properties);
   context.host.appendChild(parent, instance);
@@ -354,6 +407,7 @@ function renderHostElement<Root, Instance>(
 function renderComponent<Root, Instance>(
   component: Any,
   props: Any,
+  segment: string,
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
@@ -361,7 +415,7 @@ function renderComponent<Root, Instance>(
     throw new Error("Expected a component function, but got: " + describe(component) + ".");
   }
 
-  const instance = getInstance(context);
+  const instance = getInstance(context, component, segment);
   const previousDispatcher = ReactSharedInternals.currentDispatcher;
   const previousInstance = currentInstance;
 
@@ -383,7 +437,11 @@ function renderComponent<Root, Instance>(
     );
   }
 
-  renderNode(output, context, parent);
+  // The output belongs to this instance, so another component at the same slot
+  // renames every key below and its children mount fresh.
+  renderInScope(context, context.scope.key + "/" + segment + "@" + instance.id, () => {
+    renderNode(output, context, parent);
+  });
 }
 
 /**
@@ -392,31 +450,32 @@ function renderComponent<Root, Instance>(
  */
 function renderSuspense<Root, Instance>(
   props: Any,
+  segment: string,
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
-  const outer = context.scope;
-  const boundaryKey = outer.key + "/b" + outer.boundaryIndex++;
+  const boundaryKey = context.scope.key + "/Suspense" + segment;
+  const contentKey = boundaryKey + ":content";
   const staged = context.host.createStagingRoot();
 
-  context.scope = { key: boundaryKey + ":content", componentIndex: 0, boundaryIndex: 0 };
   try {
-    renderNode(props.children, context, staged);
-    context.host.commitStaged(parent, staged);
+    renderInScope(context, contentKey, () => {
+      renderNode(props.children, context, staged);
+      context.host.commitStaged(parent, staged);
+    });
   } catch (thrown) {
     if (!isThenable(thrown)) throw thrown;
 
     // The attempt never committed, but the retry enters at the same keys and
     // should find the hooks it already mounted.
-    retainScope(context, context.scope.key);
+    retainScope(context, contentKey);
     context.onSuspend(thrown);
 
     const fallbackStage = context.host.createStagingRoot();
-    context.scope = { key: boundaryKey + ":fallback", componentIndex: 0, boundaryIndex: 0 };
-    renderNode(props.fallback, context, fallbackStage);
-    context.host.commitStaged(parent, fallbackStage);
-  } finally {
-    context.scope = outer;
+    renderInScope(context, boundaryKey + ":fallback", () => {
+      renderNode(props.fallback, context, fallbackStage);
+      context.host.commitStaged(parent, fallbackStage);
+    });
   }
 }
 
@@ -721,7 +780,7 @@ export function renderToString(element: Any): string {
     host: htmlHost,
     instances: new Map(),
     rendered: new Set(),
-    scope: { key: "root", componentIndex: 0, boundaryIndex: 0 },
+    scope: { key: "root", index: 0 },
     rerender: noop,
     onSuspend: noop,
   };
@@ -789,7 +848,7 @@ export function createRoot(container: Element): ReactDomRoot {
     host: createDomHost(document, container),
     instances: new Map(),
     rendered: new Set(),
-    scope: { key: "root", componentIndex: 0, boundaryIndex: 0 },
+    scope: { key: "root", index: 0 },
     rerender: () => rerender(),
     onSuspend: retryWhenSettled,
   };

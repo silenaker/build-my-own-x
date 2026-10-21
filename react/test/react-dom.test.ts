@@ -6,6 +6,7 @@ import {
   createElement,
   lazy,
   use,
+  useRef,
   useState,
 } from "../react.ts";
 import type { Any } from "../shared.ts";
@@ -534,6 +535,173 @@ describe("suspense", () => {
 
     settle();
     await until(() => container.textContent === "armcount:2");
+  });
+});
+
+describe("component identity", () => {
+  /** A counter whose state belongs to one position in the tree. */
+  function Counter({ label }: { label: string }) {
+    const [count, setCount] = useState(0);
+    return createElement("button", {
+      onClick: () => setCount(count + 1),
+      children: label + count,
+    });
+  }
+
+  function mountRoot(element: Any) {
+    const document = new TestDocument();
+    const container = document.createElement("root");
+    const root = createRoot(container as unknown as Element);
+    root.render(element);
+    return { container, root };
+  }
+
+  const click = (node: Any): void => asElement(node).dispatch("click", {});
+
+  it("mounts fresh when another component takes the same position", () => {
+    function A() {
+      const [count, setCount] = useState(0);
+      return createElement("b", {
+        onClick: () => setCount(count + 1),
+        children: "a" + count,
+      });
+    }
+    function B() {
+      const [count] = useState(9);
+      return createElement("b", { children: "b" + count });
+    }
+
+    const { container, root } = mountRoot(createElement(A, {}));
+    click(container.childNodes[0]);
+    expect(container.textContent).toBe("a1");
+
+    root.render(createElement(B, {}));
+    expect(container.textContent).toBe("b9");
+  });
+
+  it("does not hand a hook slot to a different kind of hook", () => {
+    function UsesRef() {
+      useRef(0);
+      return createElement("b", { children: "ref" });
+    }
+    function UsesState() {
+      const [value] = useState("fresh");
+      return createElement("b", { children: value });
+    }
+
+    const { container, root } = mountRoot(createElement(UsesRef, {}));
+    expect(container.textContent).toBe("ref");
+
+    root.render(createElement(UsesState, {}));
+    expect(container.textContent).toBe("fresh");
+  });
+
+  it("remounts the subtree when an ancestor host element changes type", () => {
+    const { container, root } = mountRoot(
+      createElement("div", { children: createElement(Counter, { label: "n" }) }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("n1");
+
+    root.render(
+      createElement("section", { children: createElement(Counter, { label: "n" }) }),
+    );
+    expect(asElement(container.childNodes[0]).tagName).toBe("section");
+    expect(container.textContent).toBe("n0");
+  });
+
+  it("remounts when the component moves to another parent", () => {
+    const { container, root } = mountRoot(
+      createElement("div", { children: createElement(Counter, { label: "n" }) }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("n1");
+
+    root.render(
+      createElement("div", {
+        children: [createElement("span", {}), createElement(Counter, { label: "n" })],
+      }),
+    );
+    expect(container.textContent).toBe("n0");
+  });
+
+  it("keeps state with the key when keyed children reorder", () => {
+    const { container, root } = mountRoot(
+      createElement("div", {
+        children: [
+          createElement(Counter, { label: "x" }, "x"),
+          createElement(Counter, { label: "y" }, "y"),
+        ],
+      }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("x1y0");
+
+    root.render(
+      createElement("div", {
+        children: [
+          createElement(Counter, { label: "y" }, "y"),
+          createElement(Counter, { label: "x" }, "x"),
+        ],
+      }),
+    );
+    expect(container.textContent).toBe("y0x1");
+  });
+
+  it("follows position for unkeyed siblings", () => {
+    const { container, root } = mountRoot(
+      createElement("div", {
+        children: [
+          createElement(Counter, { label: "x" }),
+          createElement(Counter, { label: "y" }),
+        ],
+      }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("x1y0");
+
+    root.render(
+      createElement("div", {
+        children: [
+          createElement(Counter, { label: "y" }),
+          createElement(Counter, { label: "x" }),
+        ],
+      }),
+    );
+    // Without keys the state belongs to the slot, not to the label.
+    expect(container.textContent).toBe("y1x0");
+  });
+
+  it("keeps a keyed host subtree with its key when it moves", () => {
+    const box = (key: string) =>
+      createElement("div", { children: createElement(Counter, { label: "n" }) }, key);
+
+    const { container, root } = mountRoot(
+      createElement("section", { children: [box("a"), box("b")] }),
+    );
+    click(asElement(asElement(container.childNodes[0]).childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("n1n0");
+
+    root.render(createElement("section", { children: [box("b"), box("a")] }));
+    expect(container.textContent).toBe("n0n1");
+  });
+
+  it("keeps boundary content with its key when boundaries reorder", () => {
+    const boundary = (key: string, label: string) =>
+      createElement(
+        REACT_SUSPENSE_TYPE,
+        { fallback: "wait", children: createElement(Counter, { label }) },
+        key,
+      );
+
+    const { container, root } = mountRoot(
+      createElement("div", { children: [boundary("a", "a"), boundary("b", "b")] }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("a1b0");
+
+    root.render(createElement("div", { children: [boundary("b", "b"), boundary("a", "a")] }));
+    expect(container.textContent).toBe("b0a1");
   });
 });
 
