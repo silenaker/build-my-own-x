@@ -102,9 +102,7 @@ describe("serializing values JSON cannot express", () => {
   it("encodes bigint, registered symbols and dates", () => {
     expect(serializeBigInt(123n)).toBe("$n123");
     expect(serializeSymbol(Symbol.for("test.sym"))).toBe("$Stest.sym");
-    expect(serializeDate(new Date("2026-10-13T00:00:00.000Z"))).toBe(
-      "$D2026-10-13T00:00:00.000Z",
-    );
+    expect(serializeDate(new Date("2026-10-13T00:00:00.000Z"))).toBe("$D2026-10-13T00:00:00.000Z");
   });
 });
 

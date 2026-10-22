@@ -2,7 +2,7 @@
  * `createRoot` needs only a small slice of the DOM. This shim provides exactly
  * that slice so tests can mount and inspect trees without a browser.
  */
-import { createRoot } from "../react-dom.ts";
+import { createRoot } from "../react-dom-client.ts";
 import { type Any } from "../shared.ts";
 
 export class TestNode {

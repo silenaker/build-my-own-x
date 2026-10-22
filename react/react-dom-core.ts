@@ -11,7 +11,7 @@ import {
 } from "./react.ts";
 import { isThenable, type Any, type Thenable } from "./shared.ts";
 
-interface NormalizedProperties {
+export interface NormalizedProperties {
   /** `[attributeName, value]`, already stringified. */
   attributes: Array<[string, string]>;
   /** `[eventType, listener]`, e.g. `["click", onClick]`. */
@@ -21,7 +21,7 @@ interface NormalizedProperties {
 }
 
 /** Host seam: `Root` is the container, `Instance` is one node in it. */
-interface HostConfig<Root, Instance> {
+export interface HostConfig<Root, Instance> {
   createRoot(): Root;
   createInstance(type: string): Instance;
   createTextInstance(text: string): Instance;
@@ -32,6 +32,27 @@ interface HostConfig<Root, Instance> {
   createStagingRoot(): Root | Instance;
   /** Move everything staged into `parent`. */
   commitStaged(parent: Root | Instance, staged: Root | Instance): void;
+  /** Fizz markers live in comments, so every target has to be able to make one. */
+  createCommentInstance(text: string): Instance;
+  /** Rewrite a marker once the boundary's outcome is known. */
+  setCommentText(instance: Instance, text: string): void;
+}
+
+/**
+ * A server target that keeps suspended boundaries alive so it can write their
+ * content after the shell. `null` on targets that cannot wait.
+ */
+export interface BoundaryTracker<Root, Instance> {
+  /** The boundary whose content is being rendered, or `null` at the shell. */
+  parent: number | null;
+  /** The same boundary keeps its id when a pass renders it again. */
+  idFor(key: string): number;
+  /** The id the browser looks up, including any configured prefix. */
+  templateId(id: number): string;
+  /** The children suspended; `retry` renders them into a detached root. */
+  postpone(id: number, thenable: Thenable, retry: () => Root | Instance): void;
+  /** The boundary's content is in the document; nothing is owed for it. */
+  finish(id: number): void;
 }
 
 // ---- Component instances and the hook dispatcher ---------------------------
@@ -219,6 +240,10 @@ interface RenderContext<Root, Instance> {
    * settles; the HTML target cannot wait, so it keeps the fallback.
    */
   onSuspend: (thenable: Thenable) => void;
+  /** Set only by server targets that can complete a boundary later. */
+  boundaries: BoundaryTracker<Root, Instance> | null;
+  /** Report an error a boundary swallowed, without failing the whole tree. */
+  onError?: (error: Any) => void;
 }
 
 function renderPass<Root, Instance>(
@@ -228,8 +253,9 @@ function renderPass<Root, Instance>(
 ): void {
   context.scope = { key: "root", index: 0 };
   context.rendered.clear();
+  if (context.boundaries !== null) context.boundaries.parent = null;
   try {
-    renderNode(element, context, parent);
+    renderNode(context, element, parent);
   } catch (thrown) {
     // No enclosing boundary can show a fallback, so the tree has to be settled
     // before it is rendered again.
@@ -289,8 +315,8 @@ function getInstance<Root, Instance>(
 }
 
 function renderNode<Root, Instance>(
-  value: Any,
   context: RenderContext<Root, Instance>,
+  value: Any,
   parent: Root | Instance,
 ): void {
   // A lazy wrapper can also appear as a child, not only as an element's `type`.
@@ -301,7 +327,7 @@ function renderNode<Root, Instance>(
 
   // Arrays flatten into the parent, so they take no slot of their own.
   if (Array.isArray(node)) {
-    for (const child of node) renderNode(child, context, parent);
+    for (const child of node) renderNode(context, child, parent);
     return;
   }
 
@@ -325,7 +351,7 @@ function renderNode<Root, Instance>(
   }
 
   if (node.$$typeof === REACT_ELEMENT_TYPE) {
-    renderElement(node, index, context, parent);
+    renderElement(context, node, index, parent);
     return;
   }
   throw new Error("Objects are not valid as a React child (found: " + describe(node) + ").");
@@ -338,9 +364,9 @@ function childSegment(element: Any, index: number): string {
 }
 
 function renderElement<Root, Instance>(
+  context: RenderContext<Root, Instance>,
   element: Any,
   index: number,
-  context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
   const props: Any = element.props ?? {};
@@ -356,21 +382,21 @@ function renderElement<Root, Instance>(
   if (type === REACT_FRAGMENT_TYPE) {
     // A fragment is a level of its own, so its children are numbered inside it.
     renderInScope(context, context.scope.key + "/Fragment" + segment, () => {
-      renderNode(props.children, context, parent);
+      renderNode(context, props.children, parent);
     });
     return;
   }
   if (type === REACT_SUSPENSE_TYPE) {
-    renderSuspense(props, segment, context, parent);
+    renderSuspense(context, props, segment, parent);
     return;
   }
   if (typeof type === "string") {
-    renderHostElement(type, props, segment, context, parent);
+    renderHostElement(context, type, props, segment, parent);
     return;
   }
 
   if (typeof type === "function") {
-    renderComponent(type, props, segment, context, parent);
+    renderComponent(context, type, props, segment, parent);
     return;
   }
   throw new Error(
@@ -381,10 +407,10 @@ function renderElement<Root, Instance>(
 }
 
 function renderHostElement<Root, Instance>(
+  context: RenderContext<Root, Instance>,
   tag: string,
   props: Any,
   segment: string,
-  context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
   const instance = context.host.createInstance(tag);
@@ -396,7 +422,7 @@ function renderHostElement<Root, Instance>(
       // `dangerouslySetInnerHTML` wins over children.
       context.host.setInnerHTML(instance, properties.innerHTML);
     } else {
-      renderNode(props.children, context, instance);
+      renderNode(context, props.children, instance);
     }
   });
 
@@ -405,10 +431,10 @@ function renderHostElement<Root, Instance>(
 }
 
 function renderComponent<Root, Instance>(
+  context: RenderContext<Root, Instance>,
   component: Any,
   props: Any,
   segment: string,
-  context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
   if (typeof component !== "function") {
@@ -437,10 +463,8 @@ function renderComponent<Root, Instance>(
     );
   }
 
-  // The output belongs to this instance, so another component at the same slot
-  // renames every key below and its children mount fresh.
   renderInScope(context, context.scope.key + "/" + segment + "@" + instance.id, () => {
-    renderNode(output, context, parent);
+    renderNode(context, output, parent);
   });
 }
 
@@ -449,34 +473,122 @@ function renderComponent<Root, Instance>(
  * leaves no trace. The fallback takes its place until the root is retried.
  */
 function renderSuspense<Root, Instance>(
+  context: RenderContext<Root, Instance>,
   props: Any,
   segment: string,
-  context: RenderContext<Root, Instance>,
   parent: Root | Instance,
 ): void {
   const boundaryKey = context.scope.key + "/Suspense" + segment;
   const contentKey = boundaryKey + ":content";
-  const staged = context.host.createStagingRoot();
+  const tracker = context.boundaries;
+  const id = tracker === null ? 0 : tracker.idFor(boundaryKey);
 
+  // The start marker is written before the outcome is known, so a suspension
+  // can turn it into `$?` without moving what precedes it.
+  const start = tracker === null ? null : context.host.createCommentInstance("$");
+  if (start !== null) context.host.appendChild(parent, start);
+
+  let staged: Root | Instance;
+  try {
+    staged = renderBoundaryChildren(context, props, contentKey, id);
+  } catch (thrown) {
+    if (tracker === null) {
+      if (!isThenable(thrown)) throw thrown;
+
+      // The attempt never committed, but the retry enters at the same keys and
+      // should find the hooks it already mounted.
+      retainScope(context, contentKey);
+      context.onSuspend(thrown);
+      renderBoundaryFallback(context, props, boundaryKey, parent);
+      return;
+    }
+
+    retainScope(context, contentKey);
+
+    if (isThenable(thrown)) {
+      context.host.setCommentText(start as Instance, "$?");
+      context.host.appendChild(parent, createBoundaryTemplate(context, id, null));
+      renderBoundaryFallback(context, props, boundaryKey, parent);
+      context.host.appendChild(parent, context.host.createCommentInstance("/$"));
+      tracker.postpone(id, thrown, () => renderBoundaryChildren(context, props, contentKey, id));
+    } else {
+      // The boundary cannot recover on the client either, so its fallback is
+      // the final output and the error only goes to `onError`.
+      context.host.setCommentText(start as Instance, "$!");
+      context.host.appendChild(parent, createBoundaryTemplate(context, id, thrown));
+      renderBoundaryFallback(context, props, boundaryKey, parent);
+      context.host.appendChild(parent, context.host.createCommentInstance("/$"));
+      context.onError?.(thrown);
+      tracker.finish(id);
+    }
+    return;
+  }
+
+  context.host.commitStaged(parent, staged);
+  if (tracker !== null) {
+    context.host.appendChild(parent, context.host.createCommentInstance("/$"));
+    tracker.finish(id);
+  }
+}
+
+/** Render the boundary's children into a detached root, naming `id` as their parent. */
+function renderBoundaryChildren<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  id: number,
+): Root | Instance {
+  const tracker = context.boundaries;
+  const previous = tracker === null ? null : tracker.parent;
+  if (tracker !== null) tracker.parent = id;
+  const staged = context.host.createStagingRoot();
   try {
     renderInScope(context, contentKey, () => {
-      renderNode(props.children, context, staged);
-      context.host.commitStaged(parent, staged);
+      renderNode(context, props.children, staged);
     });
-  } catch (thrown) {
-    if (!isThenable(thrown)) throw thrown;
+  } finally {
+    if (tracker !== null) tracker.parent = previous;
+  }
+  return staged;
+}
 
-    // The attempt never committed, but the retry enters at the same keys and
-    // should find the hooks it already mounted.
-    retainScope(context, contentKey);
-    context.onSuspend(thrown);
-
+/** Fallbacks are already in the document, so a boundary inside one can stream at once. */
+function renderBoundaryFallback<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  boundaryKey: string,
+  parent: Root | Instance,
+): void {
+  const tracker = context.boundaries;
+  const previous = tracker === null ? null : tracker.parent;
+  if (tracker !== null) tracker.parent = null;
+  try {
     const fallbackStage = context.host.createStagingRoot();
     renderInScope(context, boundaryKey + ":fallback", () => {
-      renderNode(props.fallback, context, fallbackStage);
+      renderNode(context, props.fallback, fallbackStage);
       context.host.commitStaged(parent, fallbackStage);
     });
+  } finally {
+    if (tracker !== null) tracker.parent = previous;
   }
+}
+
+/** The `<template id>` the reveal script targets. */
+function createBoundaryTemplate<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  id: number,
+  error: Any,
+): Instance {
+  const template = context.host.createInstance("template");
+  const attributes: Array<[string, string]> = [
+    ["id", context.boundaries === null ? "B" + id : context.boundaries.templateId(id)],
+  ];
+  if (error !== null) {
+    attributes.push(["data-dgst", ""]);
+    attributes.push(["data-msg", error instanceof Error ? error.message : String(error)]);
+  }
+  context.host.setInitialProperties(template, { attributes, events: [], innerHTML: null });
+  return template;
 }
 
 /** Keep every instance mounted before an attempt that suspended, so the retry reuses it. */
@@ -488,6 +600,58 @@ function retainScope<Root, Instance>(
   for (const key of context.instances.keys()) {
     if (key.startsWith(prefix)) context.rendered.add(key);
   }
+}
+
+// ---- The public renderer ---------------------------------------------------
+
+export interface RendererOptions<Root, Instance> {
+  /** Set only by server targets that can complete a boundary later. */
+  boundaries?: BoundaryTracker<Root, Instance> | null;
+  /** Report an error a boundary swallowed, without failing the whole tree. */
+  onError?: (error: Any) => void;
+  /** Re-render the root after a state update; the DOM target supplies one. */
+  rerender?: () => void;
+  /** A boundary suspended; the DOM target retries once it settles. */
+  onSuspend?: (thenable: Thenable) => void;
+}
+
+/** One host-bound walker. Every pass reuses the hook instances it mounted. */
+export interface Renderer<Root> {
+  /** Fill a fresh root with `element`. */
+  render(element: Any): Root;
+  /** Drop every mounted instance, so the next pass mounts fresh. */
+  reset(): void;
+}
+
+/**
+ * The client and the server differ in their host and their lifecycle, not in
+ * the walk. This keeps the walk and the hook slots in one place for both.
+ */
+export function createRenderer<Root, Instance>(
+  host: HostConfig<Root, Instance>,
+  options: RendererOptions<Root, Instance> = {},
+): Renderer<Root> {
+  const context: RenderContext<Root, Instance> = {
+    host,
+    instances: new Map(),
+    rendered: new Set(),
+    scope: { key: "root", index: 0 },
+    rerender: options.rerender ?? noop,
+    onSuspend: options.onSuspend ?? noop,
+    boundaries: options.boundaries ?? null,
+    onError: options.onError,
+  };
+  return {
+    render(element) {
+      const root = host.createRoot();
+      renderPass(context, element, root);
+      return root;
+    },
+    reset() {
+      context.instances.clear();
+      context.rendered.clear();
+    },
+  };
 }
 
 // ---- Prop normalization ----------------------------------------------------
@@ -676,225 +840,4 @@ function describe(value: Any): string {
   if (isClientReference(node)) return "a client reference";
   if (isServerReference(node)) return "a server reference";
   return "an object";
-}
-
-// ---- The HTML host (renderToString) ----------------------------------------
-
-interface HtmlRoot {
-  kind: "root";
-  children: HtmlNode[];
-}
-interface HtmlElement {
-  kind: "element";
-  tag: string;
-  attributes: Array<[string, string]>;
-  children: HtmlNode[];
-  innerHTML: string | null;
-}
-interface HtmlText {
-  kind: "text";
-  text: string;
-}
-type HtmlNode = HtmlElement | HtmlText;
-
-const htmlHost: HostConfig<HtmlRoot, HtmlNode> = {
-  createRoot: () => ({ kind: "root", children: [] }),
-  createInstance: (tag) => ({
-    kind: "element",
-    tag,
-    attributes: [],
-    children: [],
-    innerHTML: null,
-  }),
-  createTextInstance: (text) => ({ kind: "text", text }),
-  appendChild: (parent, child) => {
-    if (parent.kind === "root" || parent.kind === "element") {
-      parent.children.push(child);
-    } else {
-      throw new Error("Cannot append a child to a text node.");
-    }
-  },
-  setInitialProperties: (instance, properties) => {
-    if (instance.kind === "element") instance.attributes = properties.attributes;
-  },
-  setInnerHTML: (instance, html) => {
-    if (instance.kind === "element") instance.innerHTML = html;
-  },
-  createStagingRoot: () => ({ kind: "root", children: [] }),
-  commitStaged: (parent, staged) => {
-    if ((parent.kind === "root" || parent.kind === "element") && staged.kind === "root") {
-      for (const child of staged.children) parent.children.push(child);
-      staged.children.length = 0;
-    }
-  },
-};
-
-/** Elements that must not have a closing tag. */
-const VOID_ELEMENTS = new Set([
-  "area",
-  "base",
-  "br",
-  "col",
-  "embed",
-  "hr",
-  "img",
-  "input",
-  "link",
-  "meta",
-  "param",
-  "source",
-  "track",
-  "wbr",
-]);
-
-const ESCAPE_LOOKUP: Record<string, string> = {
-  "&": "&amp;",
-  "<": "&lt;",
-  ">": "&gt;",
-  '"': "&quot;",
-  "'": "&#x27;",
-};
-const ESCAPE_REGEX = /[&<>"']/g;
-
-/** Escape text and attribute values. */
-function escapeText(text: string): string {
-  return text.replace(ESCAPE_REGEX, (character) => ESCAPE_LOOKUP[character]);
-}
-
-function serializeNode(node: HtmlRoot | HtmlNode): string {
-  if (node.kind === "root") return node.children.map(serializeNode).join("");
-  if (node.kind === "text") return escapeText(node.text);
-
-  const attributes = node.attributes
-    .map(([name, value]) => " " + name + '="' + escapeText(value) + '"')
-    .join("");
-  if (VOID_ELEMENTS.has(node.tag.toLowerCase())) return "<" + node.tag + attributes + "/>";
-
-  const content =
-    node.innerHTML !== null ? node.innerHTML : node.children.map(serializeNode).join("");
-  return "<" + node.tag + attributes + ">" + content + "</" + node.tag + ">";
-}
-
-export function renderToString(element: Any): string {
-  const context: RenderContext<HtmlRoot, HtmlNode> = {
-    host: htmlHost,
-    instances: new Map(),
-    rendered: new Set(),
-    scope: { key: "root", index: 0 },
-    rerender: noop,
-    onSuspend: noop,
-  };
-  const root = context.host.createRoot();
-  renderPass(context, element, root);
-  return serializeNode(root);
-}
-
-// ---- The DOM host (createRoot) ---------------------------------------------
-
-export interface ReactDomRoot {
-  /** Mount `element`. A later `render` replaces the whole tree. */
-  render(element: Any): void;
-  /** Remove everything this root rendered. */
-  unmount(): void;
-}
-
-function createDomHost(document: Document, container: Element): HostConfig<Element, Node> {
-  return {
-    createRoot: () => container,
-    createInstance: (tag) => document.createElement(tag),
-    createTextInstance: (text) => document.createTextNode(text),
-    appendChild: (parent, child) => {
-      parent.appendChild(child);
-    },
-    setInitialProperties: (instance, properties) => {
-      // Only elements reach here; text nodes have no properties.
-      const element = instance as Element;
-      for (const [name, value] of properties.attributes) element.setAttribute(name, value);
-      for (const [type, listener] of properties.events) element.addEventListener(type, listener);
-    },
-    setInnerHTML: (instance, html) => {
-      (instance as Element).innerHTML = html;
-    },
-    createStagingRoot: () => document.createDocumentFragment(),
-    commitStaged: (parent, staged) => {
-      (parent as Node).appendChild(staged as Node);
-    },
-  };
-}
-
-function clearChildren(container: Element): void {
-  let child = container.firstChild;
-  while (child !== null) {
-    container.removeChild(child);
-    child = container.firstChild;
-  }
-}
-
-export function createRoot(container: Element): ReactDomRoot {
-  const document = container.ownerDocument;
-  if (document === null) {
-    throw new Error("createRoot() requires a container that belongs to a document.");
-  }
-
-  /** Thenables a boundary is waiting on, so a settlement retries the root once. */
-  const waiting = new Set<Thenable>();
-
-  let rootElement: Any = null;
-  let mounted = false;
-  let rendering = false;
-  let needsRerender = false;
-
-  const context: RenderContext<Element, Node> = {
-    host: createDomHost(document, container),
-    instances: new Map(),
-    rendered: new Set(),
-    scope: { key: "root", index: 0 },
-    rerender: () => rerender(),
-    onSuspend: retryWhenSettled,
-  };
-
-  function retryWhenSettled(thenable: Thenable): void {
-    if (waiting.has(thenable)) return;
-    waiting.add(thenable);
-    const retry = (): void => {
-      waiting.delete(thenable);
-      rerender();
-    };
-    // A rejection retries too: `use()` throws the reason on the next pass.
-    thenable.then(retry, retry);
-  }
-
-  function rerender(): void {
-    if (!mounted) return;
-    if (rendering) {
-      needsRerender = true;
-      return;
-    }
-    rendering = true;
-    try {
-      do {
-        needsRerender = false;
-        clearChildren(container);
-        renderPass(context, rootElement, container);
-      } while (needsRerender);
-    } finally {
-      rendering = false;
-    }
-  }
-
-  return {
-    render(element: Any): void {
-      rootElement = element;
-      mounted = true;
-      rerender();
-    },
-    unmount(): void {
-      clearChildren(container);
-      context.instances.clear();
-      context.rendered.clear();
-      waiting.clear();
-      mounted = false;
-      rootElement = null;
-    },
-  };
 }

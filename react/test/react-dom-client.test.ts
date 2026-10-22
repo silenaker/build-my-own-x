@@ -1,7 +1,10 @@
+/**
+ * Client behavior: mounting, re-rendering and Suspense retries against the DOM
+ * host. Server-side string output lives in `render-to-string.test.ts`.
+ */
 import { describe, expect, it } from "vitest";
 import {
   REACT_FRAGMENT_TYPE,
-  REACT_LAZY_TYPE,
   REACT_SUSPENSE_TYPE,
   createElement,
   lazy,
@@ -10,282 +13,9 @@ import {
   useState,
 } from "../react.ts";
 import type { Any } from "../shared.ts";
-import { createRoot, renderToString } from "../react-dom.ts";
+import { createRoot } from "../react-dom-client.ts";
 import { asElement, mount, TestDocument, TestText } from "./dom-shim.ts";
-import { deepAwait } from "../react-flight-client.ts";
 import { until } from "./helpers.ts";
-
-describe("leaves", () => {
-  it("renders nothing for null, undefined and booleans", () => {
-    expect(renderToString(null)).toBe("");
-    expect(renderToString(undefined)).toBe("");
-    expect(renderToString(false)).toBe("");
-    expect(renderToString(true)).toBe("");
-  });
-
-  it("renders strings, numbers and bigints as text", () => {
-    expect(renderToString("hi")).toBe("hi");
-    expect(renderToString(42)).toBe("42");
-    expect(renderToString(0)).toBe("0");
-    expect(renderToString(-0)).toBe("0");
-    expect(renderToString(10n)).toBe("10");
-    expect(renderToString(["a", 1, null, false, "b"])).toBe("a1b");
-  });
-
-  it("escapes text children", () => {
-    expect(renderToString('<b>&"\'')).toBe("&lt;b&gt;&amp;&quot;&#x27;");
-  });
-});
-
-describe("host elements", () => {
-  it("renders simple and nested trees", () => {
-    expect(renderToString(createElement("div", { children: "hi" }))).toBe("<div>hi</div>");
-    expect(
-      renderToString(
-        createElement("div", {
-          children: [
-            createElement("span", { children: "a" }),
-            createElement("b", { children: "b" }),
-          ],
-        }),
-      ),
-    ).toBe("<div><span>a</span><b>b</b></div>");
-  });
-
-  it("renders empty and void elements", () => {
-    expect(renderToString(createElement("div", {}))).toBe("<div></div>");
-    expect(renderToString(createElement("br", {}))).toBe("<br/>");
-    expect(renderToString(createElement("hr", {}))).toBe("<hr/>");
-    expect(renderToString(createElement("img", { src: "a.png", alt: "" }))).toBe(
-      '<img src="a.png" alt=""/>',
-    );
-    expect(renderToString(createElement("input", { type: "text", value: "v" }))).toBe(
-      '<input type="text" value="v"/>',
-    );
-  });
-
-  it("maps prop aliases and keeps data/aria attributes", () => {
-    expect(
-      renderToString(
-        createElement("label", {
-          htmlFor: "x",
-          className: "a b",
-          id: "x",
-          "data-role": "btn",
-          "aria-hidden": "true",
-        }),
-      ),
-    ).toBe('<label for="x" class="a b" id="x" data-role="btn" aria-hidden="true"></label>');
-  });
-
-  it("handles boolean and default attributes", () => {
-    expect(
-      renderToString(createElement("button", { disabled: true, hidden: false, children: "go" })),
-    ).toBe('<button disabled="">go</button>');
-    expect(renderToString(createElement("input", { readOnly: true }))).toBe(
-      '<input readOnly=""/>',
-    );
-    expect(renderToString(createElement("input", { defaultValue: "d" }))).toBe(
-      '<input value="d"/>',
-    );
-    expect(renderToString(createElement("input", { defaultChecked: true }))).toBe(
-      '<input checked=""/>',
-    );
-    expect(renderToString(createElement("div", { draggable: true }))).toBe(
-      '<div draggable="true"></div>',
-    );
-    expect(renderToString(createElement("div", { draggable: false }))).toBe(
-      '<div draggable="false"></div>',
-    );
-  });
-
-  it("escapes attribute values", () => {
-    expect(renderToString(createElement("div", { title: 'a"b&c' }))).toBe(
-      '<div title="a&quot;b&amp;c"></div>',
-    );
-  });
-
-  it("skips props that are not attributes", () => {
-    expect(
-      renderToString(
-        createElement("div", {
-          children: "x",
-          key: "k",
-          ref: () => {},
-          onClick: () => {},
-          ignored: { nested: true },
-          alsoIgnored: Symbol("s"),
-        }),
-      ),
-    ).toBe("<div>x</div>");
-  });
-
-  it("renders unknown host tags", () => {
-    expect(renderToString(createElement("my-element", { children: "x" }))).toBe(
-      "<my-element>x</my-element>",
-    );
-  });
-});
-
-describe("style", () => {
-  it("converts a style object to inline CSS with units", () => {
-    expect(
-      renderToString(
-        createElement("div", {
-          style: {
-            color: "red",
-            marginTop: 5,
-            opacity: 0.5,
-            lineHeight: 1.5,
-            zIndex: 2,
-            margin: 0,
-          },
-        }),
-      ),
-    ).toBe(
-      '<div style="color:red;margin-top:5px;opacity:0.5;line-height:1.5;z-index:2;margin:0"></div>',
-    );
-  });
-
-  it("keeps a style string verbatim", () => {
-    expect(renderToString(createElement("div", { style: "color:red" }))).toBe(
-      '<div style="color:red"></div>',
-    );
-  });
-
-  it("omits empty styles and unitless vendor properties", () => {
-    expect(renderToString(createElement("div", { style: { color: null } }))).toBe("<div></div>");
-    expect(renderToString(createElement("div", { style: { WebkitLineClamp: 2 } }))).toBe(
-      '<div style="-webkit-line-clamp:2"></div>',
-    );
-  });
-});
-
-describe("dangerouslySetInnerHTML", () => {
-  it("renders raw HTML and ignores children", () => {
-    expect(
-      renderToString(
-        createElement("div", {
-          dangerouslySetInnerHTML: { __html: "<b>raw &amp; bold</b>" },
-          children: "ignored",
-        }),
-      ),
-    ).toBe("<div><b>raw &amp; bold</b></div>");
-  });
-
-  it("renders an empty raw HTML string", () => {
-    expect(
-      renderToString(createElement("div", { dangerouslySetInnerHTML: { __html: "" } })),
-    ).toBe("<div></div>");
-  });
-});
-
-describe("elements", () => {
-  it("ignores event handlers in HTML", () => {
-    expect(renderToString(createElement("button", { onClick: () => {}, children: "x" }))).toBe(
-      "<button>x</button>",
-    );
-  });
-
-  it("ignores keys", () => {
-    expect(renderToString(createElement("li", { children: "a" }, "k1"))).toBe("<li>a</li>");
-  });
-
-  it("renders fragments and suspense children, not the fallback", () => {
-    expect(
-      renderToString(
-        createElement(REACT_FRAGMENT_TYPE, {
-          children: [
-            createElement("a", { children: "1" }),
-            createElement("b", { children: "2" }),
-          ],
-        }),
-      ),
-    ).toBe("<a>1</a><b>2</b>");
-    expect(
-      renderToString(
-        createElement(REACT_SUSPENSE_TYPE, {
-          fallback: createElement("p", { children: "loading" }),
-          children: createElement("div", { children: "done" }),
-        }),
-      ),
-    ).toBe("<div>done</div>");
-  });
-
-  it("renders function components and their return shapes", () => {
-    const Greeting = (props: { name: string }) =>
-      createElement("h1", { children: "Hello " + props.name });
-    expect(renderToString(createElement(Greeting, { name: "RSC" }))).toBe("<h1>Hello RSC</h1>");
-
-    const List = () => [
-      createElement("li", { children: "a" }),
-      createElement("li", { children: "b" }),
-    ];
-    expect(renderToString(createElement("ul", { children: createElement(List, {}) }))).toBe(
-      "<ul><li>a</li><li>b</li></ul>",
-    );
-
-    const Nothing = () => null;
-    expect(renderToString(createElement("div", { children: createElement(Nothing, {}) }))).toBe(
-      "<div></div>",
-    );
-
-    function Inner() {
-      return createElement("b", { children: "nested" });
-    }
-    const Outer = () => createElement(Inner, {});
-    expect(renderToString(createElement(Outer, {}))).toBe("<b>nested</b>");
-  });
-});
-
-describe("lazy", () => {
-  it("renders a lazy child and a lazy element type", () => {
-    const lazyChild = {
-      $$typeof: REACT_LAZY_TYPE,
-      _init: () => createElement("em", { children: "lazy" }),
-    };
-    expect(renderToString(createElement("div", { children: lazyChild }))).toBe(
-      "<div><em>lazy</em></div>",
-    );
-
-    const lazyComponent = {
-      $$typeof: REACT_LAZY_TYPE,
-      _init: () => (props: Any) => createElement("u", { children: props.label }),
-    };
-    expect(renderToString(createElement(lazyComponent, { label: "u" }))).toBe("<u>u</u>");
-  });
-
-  it("explains how to fix a lazy type that suspends synchronously", () => {
-    const suspending = {
-      $$typeof: REACT_LAZY_TYPE,
-      _init() {
-        throw { then() {} };
-      },
-    };
-    expect(() => renderToString(createElement(suspending, {}))).toThrow(
-      "suspended while rendering synchronously",
-    );
-  });
-
-  it("loads React.lazy's default export once and caches it", async () => {
-    let loads = 0;
-    const Widget = lazy(() => {
-      loads++;
-      return Promise.resolve({
-        default: (props: Any) => createElement("b", { children: props.label }),
-      });
-    });
-    // The first read suspends on the loader; `deepAwait` waits and reads again.
-    const tree = await deepAwait(
-      createElement("div", { children: createElement(Widget, { label: "hi" }) }),
-    );
-    expect(renderToString(tree)).toBe("<div><b>hi</b></div>");
-    expect(loads).toBe(1);
-
-    renderToString(tree);
-    expect(loads).toBe(1);
-  });
-});
 
 describe("suspense", () => {
   const never = new Promise<never>(() => {});
@@ -295,67 +25,6 @@ describe("suspense", () => {
     use(never);
     return createElement("b", { children: "unreachable" });
   }
-
-  it("renders the fallback instead of the suspended children", () => {
-    expect(
-      renderToString(
-        createElement(REACT_SUSPENSE_TYPE, {
-          fallback: createElement("p", { children: "loading" }),
-          children: createElement(Suspends, {}),
-        }),
-      ),
-    ).toBe("<p>loading</p>");
-  });
-
-  it("drops the output produced before the suspension", () => {
-    expect(
-      renderToString(
-        createElement(REACT_SUSPENSE_TYPE, {
-          fallback: "loading",
-          children: createElement("div", {
-            children: [
-              createElement("span", { children: "partial" }),
-              createElement(Suspends, {}),
-            ],
-          }),
-        }),
-      ),
-    ).toBe("loading");
-  });
-
-  it("lets the nearest boundary handle the suspension", () => {
-    expect(
-      renderToString(
-        createElement(REACT_SUSPENSE_TYPE, {
-          fallback: "outer",
-          children: createElement(REACT_SUSPENSE_TYPE, {
-            fallback: "inner",
-            children: createElement(Suspends, {}),
-          }),
-        }),
-      ),
-    ).toBe("inner");
-  });
-
-  it("keeps a ready sibling of a suspended boundary", () => {
-    expect(
-      renderToString(
-        createElement("div", {
-          children: [
-            createElement("span", { children: "ready" }),
-            createElement(REACT_SUSPENSE_TYPE, {
-              fallback: "wait",
-              children: createElement(Suspends, {}),
-            }),
-          ],
-        }),
-      ),
-    ).toBe("<div><span>ready</span>wait</div>");
-  });
-
-  it("explains a suspension with no boundary", () => {
-    expect(() => renderToString(createElement(Suspends, {}))).toThrow("no <Suspense> boundary");
-  });
 
   it("shows the fallback, then the content once the thenable settles", async () => {
     let settle!: (value: string) => void;
@@ -603,9 +272,7 @@ describe("component identity", () => {
     click(asElement(container.childNodes[0]).childNodes[0]);
     expect(container.textContent).toBe("n1");
 
-    root.render(
-      createElement("section", { children: createElement(Counter, { label: "n" }) }),
-    );
+    root.render(createElement("section", { children: createElement(Counter, { label: "n" }) }));
     expect(asElement(container.childNodes[0]).tagName).toBe("section");
     expect(container.textContent).toBe("n0");
   });
@@ -651,10 +318,7 @@ describe("component identity", () => {
   it("follows position for unkeyed siblings", () => {
     const { container, root } = mountRoot(
       createElement("div", {
-        children: [
-          createElement(Counter, { label: "x" }),
-          createElement(Counter, { label: "y" }),
-        ],
+        children: [createElement(Counter, { label: "x" }), createElement(Counter, { label: "y" })],
       }),
     );
     click(asElement(container.childNodes[0]).childNodes[0]);
@@ -662,10 +326,7 @@ describe("component identity", () => {
 
     root.render(
       createElement("div", {
-        children: [
-          createElement(Counter, { label: "y" }),
-          createElement(Counter, { label: "x" }),
-        ],
+        children: [createElement(Counter, { label: "y" }), createElement(Counter, { label: "x" })],
       }),
     );
     // Without keys the state belongs to the slot, not to the label.
@@ -702,25 +363,6 @@ describe("component identity", () => {
 
     root.render(createElement("div", { children: [boundary("b", "b"), boundary("a", "a")] }));
     expect(container.textContent).toBe("b0a1");
-  });
-});
-
-describe("invalid input", () => {
-  it("throws for invalid element types", () => {
-    expect(() => renderToString(createElement(42, {}))).toThrow("Element type is invalid");
-    expect(() => renderToString(createElement({}, {}))).toThrow("Element type is invalid");
-  });
-
-  it("throws for invalid children", () => {
-    expect(() => renderToString(createElement("div", { children: { a: 1 } }))).toThrow(
-      "Objects are not valid as a React child",
-    );
-    expect(() => renderToString(createElement("div", { children: () => null }))).toThrow(
-      "Functions are not valid as a React child",
-    );
-    expect(() => renderToString(createElement("div", { children: Symbol("s") }))).toThrow(
-      "Symbols are not valid as a React child",
-    );
   });
 });
 

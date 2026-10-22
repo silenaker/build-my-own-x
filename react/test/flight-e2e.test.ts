@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createClientReference, createElement, use, useState } from "../react.ts";
 import type { Any } from "../shared.ts";
-import { createRoot, renderToString } from "../react-dom.ts";
+import { createRoot } from "../react-dom-client.ts";
+import { renderToString } from "../react-dom-server.ts";
 import { createFromReadableStream, deepAwait } from "../react-flight-client.ts";
 import { renderToReadableStream } from "../react-flight-server.ts";
 import { sleep } from "./helpers.ts";

@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { REACT_LAZY_TYPE } from "../react.ts";
-import {
-  Chunk,
-  createFromReadableStream,
-  deepAwait,
-} from "../react-flight-client.ts";
+import { Chunk, createFromReadableStream, deepAwait } from "../react-flight-client.ts";
 import type { Any } from "../shared.ts";
 import { gate, withTimeout } from "./helpers.ts";
 
@@ -58,7 +54,7 @@ describe("incremental reading", () => {
   it("parses several rows delivered in one chunk", async () => {
     const { stream, push, close } = controlledStream();
     const root = createFromReadableStream(stream, {
-      clientModules: {"./C.js": {C: () => null}},
+      clientModules: { "./C.js": { C: () => null } },
     });
 
     push('1:I{"id":"./C.js","name":"C"}\n0:{"v":"$L1"}\n');

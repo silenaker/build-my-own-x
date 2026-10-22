@@ -145,9 +145,9 @@ describe("references", () => {
 
   it("fails loudly when a client reference cannot be resolved", async () => {
     const Widget = createClientReference("./Widget.js", "Widget");
-    await expect(
-      roundTrip({ element: createElement(Widget, {}) }),
-    ).rejects.toThrow("Could not resolve the client reference");
+    await expect(roundTrip({ element: createElement(Widget, {}) })).rejects.toThrow(
+      "Could not resolve the client reference",
+    );
   });
 
   it("keeps a server reference as an action marker", async () => {
@@ -205,10 +205,7 @@ describe("elements", () => {
 describe("server components", () => {
   it("inlines fragments, primitives and nested components", async () => {
     function Frag() {
-      return [
-        createElement("span", { children: "x" }),
-        createElement("span", { children: "y" }),
-      ];
+      return [createElement("span", { children: "x" }), createElement("span", { children: "y" })];
     }
     function Text() {
       return "plain text";
@@ -431,7 +428,9 @@ describe("suspense", () => {
       return createElement("p", { children: d1.a + d2.b });
     }
 
-    const { value, rows } = await roundTrip({ root: createElement("div", { children: createElement(Slow, {}) }) });
+    const { value, rows } = await roundTrip({
+      root: createElement("div", { children: createElement(Slow, {}) }),
+    });
     expect(rows).toHaveLength(2);
     expect(rows[1]).not.toContain("$1");
     expect(value.root.props.children.props.children).toBe("AB");

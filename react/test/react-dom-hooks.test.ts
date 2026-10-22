@@ -1,14 +1,8 @@
 import { describe, expect, it } from "vitest";
-import {
-  createElement,
-  useCallback,
-  useMemo,
-  useReducer,
-  useRef,
-  useState,
-} from "../react.ts";
+import { createElement, useCallback, useMemo, useReducer, useRef, useState } from "../react.ts";
 import type { Any } from "../shared.ts";
-import { createRoot, renderToString } from "../react-dom.ts";
+import { createRoot } from "../react-dom-client.ts";
+import { renderToString } from "../react-dom-server.ts";
 import { asElement, mount, TestDocument } from "./dom-shim.ts";
 
 /** Dispatch a click on the first node of the container. */

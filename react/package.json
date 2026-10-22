@@ -3,10 +3,12 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit && oxfmt --check",
+    "fmt": "oxfmt"
   },
   "devDependencies": {
+    "@types/node": "^26.6.5",
+    "oxfmt": "^0.74.0",
     "typescript": "^6.0.3",
     "vitest": "^5.0.5"
   },

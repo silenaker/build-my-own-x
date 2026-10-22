@@ -18,9 +18,7 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
 
 describe("server rows", () => {
   it("writes the root model as row 0", async () => {
-    expect(await readAll(renderToReadableStream({ hello: "world" }))).toBe(
-      '0:{"hello":"world"}\n',
-    );
+    expect(await readAll(renderToReadableStream({ hello: "world" }))).toBe('0:{"hello":"world"}\n');
   });
 
   it("encodes special values inline", async () => {
