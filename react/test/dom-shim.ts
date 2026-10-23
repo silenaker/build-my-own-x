@@ -24,6 +24,20 @@ export class TestNode {
     this.childNodes.push(child);
     return child;
   }
+  insertBefore<T extends TestNode>(child: T, reference: TestNode | null): T {
+    if (reference === null) return this.appendChild(child);
+    if (child instanceof TestFragment) {
+      // A fragment inserts its children in order, keeping the reference.
+      for (const grandchild of child.childNodes.slice()) this.insertBefore(grandchild, reference);
+      return child;
+    }
+    const index = this.childNodes.indexOf(reference);
+    if (index === -1) throw new Error("insertBefore() reference is not a child.");
+    if (child.parentNode !== null) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    this.childNodes.splice(index, 0, child);
+    return child;
+  }
   removeChild<T extends TestNode>(child: T): T {
     const index = this.childNodes.indexOf(child);
     if (index !== -1) this.childNodes.splice(index, 1);
@@ -32,6 +46,18 @@ export class TestNode {
   }
   get firstChild(): TestNode | null {
     return this.childNodes.length > 0 ? this.childNodes[0] : null;
+  }
+  get nextSibling(): TestNode | null {
+    const parent = this.parentNode;
+    if (parent === null) return null;
+    const index = parent.childNodes.indexOf(this);
+    return index === -1 ? null : (parent.childNodes[index + 1] ?? null);
+  }
+  get previousSibling(): TestNode | null {
+    const parent = this.parentNode;
+    if (parent === null) return null;
+    const index = parent.childNodes.indexOf(this);
+    return index <= 0 ? null : (parent.childNodes[index - 1] ?? null);
   }
 }
 

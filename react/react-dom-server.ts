@@ -86,16 +86,27 @@ const htmlHost: HostConfig<HtmlRoot, HtmlNode> = {
     if (instance.kind === "element") instance.innerHTML = html;
   },
   createStagingRoot: () => ({ kind: "root", children: [] }),
-  commitStaged: (parent, staged) => {
+  commitStaged: (parent, staged, reference) => {
     if ((parent.kind === "root" || parent.kind === "element") && staged.kind === "root") {
-      for (const child of staged.children) parent.children.push(child);
+      const index =
+        reference === null || reference === undefined
+          ? parent.children.length
+          : parent.children.indexOf(reference as HtmlNode);
+      parent.children.splice(index === -1 ? parent.children.length : index, 0, ...staged.children);
       staged.children.length = 0;
     }
+  },
+  clearBetween: (parent, start, end) => {
+    if (parent.kind !== "root" && parent.kind !== "element") return;
+    const from = parent.children.indexOf(start as HtmlNode);
+    const to = parent.children.indexOf(end as HtmlNode);
+    if (from !== -1 && to !== -1) parent.children.splice(from + 1, to - from - 1);
   },
   createCommentInstance: (text) => ({ kind: "comment", data: text }),
   setCommentText: (instance, text) => {
     if (instance.kind === "comment") instance.data = text;
   },
+  getCommentText: (instance) => (instance.kind === "comment" ? instance.data : ""),
 };
 
 /** Elements that must not have a closing tag. */
@@ -197,10 +208,14 @@ interface PendingBoundary {
  * and turn its `$?` marker into `$`.
  */
 function revealBoundary(boundaryId: string, contentId: string): void {
-  const template = document.getElementById(boundaryId);
   const content = document.getElementById(contentId);
-  // Hydration and a cancelled boundary can both remove either node.
-  if (template === null || content === null) return;
+  if (content === null) return;
+  // Detach the streamed content as a client takeover removes the template, nothing left to fill in
+  const contentParent = content.parentNode;
+  if (contentParent !== null) contentParent.removeChild(content);
+
+  const template = document.getElementById(boundaryId);
+  if (template === null) return;
 
   // The boundary starts at the comment right before its template.
   const marker = template.previousSibling as Comment | null;
@@ -233,8 +248,6 @@ function revealBoundary(boundaryId: string, contentId: string): void {
   }
 
   marker.data = "$";
-  const contentParent = content.parentNode;
-  if (contentParent !== null) contentParent.removeChild(content);
 }
 
 /**
@@ -255,8 +268,8 @@ function clientRenderBoundary(boundaryId: string, message: string): void {
  * The instructions travel as source, so the shell needs no shared runtime.
  * Both functions only touch globals, which keeps `toString()` self-contained.
  */
-const REVEAL_BOUNDARY = revealBoundary.toString();
-const CLIENT_RENDER_BOUNDARY = clientRenderBoundary.toString();
+export const REVEAL_BOUNDARY = revealBoundary.toString();
+export const CLIENT_RENDER_BOUNDARY = clientRenderBoundary.toString();
 
 /** A self-contained script call, so the page needs no global runtime. */
 function inlineCall(fn: string, ...args: string[]): string {

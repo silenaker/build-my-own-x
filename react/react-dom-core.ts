@@ -30,12 +30,51 @@ export interface HostConfig<Root, Instance> {
   setInnerHTML(instance: Instance, html: string): void;
   /** A detached parent, so a boundary keeps its output out of the tree until it is whole. */
   createStagingRoot(): Root | Instance;
-  /** Move everything staged into `parent`. */
-  commitStaged(parent: Root | Instance, staged: Root | Instance): void;
+  /** Move everything staged into `parent`, right before `reference` when one is given. */
+  commitStaged(parent: Root | Instance, staged: Root | Instance, reference?: Instance | null): void;
+  /** Remove every child of `parent` strictly between two boundary markers. */
+  clearBetween(parent: Root | Instance, start: Instance, end: Instance): void;
   /** Fizz markers live in comments, so every target has to be able to make one. */
   createCommentInstance(text: string): Instance;
   /** Rewrite a marker once the boundary's outcome is known. */
   setCommentText(instance: Instance, text: string): void;
+  /** Read a marker's data; a retry checks whether the server revealed content. */
+  getCommentText(instance: Instance): string;
+  /** Set only on targets whose containers may already hold server markup. */
+  hydration?: HydrationConfig<Root, Instance> | null;
+}
+
+/** One server node a hydrating container still has to match. */
+export interface HydrationNode<Instance> {
+  instance: Instance;
+  kind: "element" | "text" | "comment" | "other";
+  /** Tag name for elements, the data for text and comment nodes. */
+  value: string;
+}
+
+/**
+ * Reuse is positional: the walker asks each container for its next unclaimed
+ * node, and the host knows where that node is and whether it is still there.
+ */
+export interface HydrationConfig<Root, Instance> {
+  /** Start a pass over the children `root` already holds. */
+  begin(root: Root): void;
+  /** The next unclaimed child of `parent`, or `null` once the markup runs out. */
+  next(parent: Root | Instance): HydrationNode<Instance> | null;
+  /** Keep the node at the cursor; the walker matched it. */
+  accept(parent: Root | Instance, node: HydrationNode<Instance>): void;
+  /** Leave the node in place but advance past it; a deferred boundary keeps its markup. */
+  skip(parent: Root | Instance, node: HydrationNode<Instance>): void;
+  /** Remove the node at the cursor; the walker cannot use it. */
+  drop(parent: Root | Instance, node: HydrationNode<Instance>): void;
+  /** Remove what the pass never claimed, then forget its cursors. */
+  finish(root: Root): void;
+  /** Drop every child of `root`, so the client can render from scratch. */
+  clear(root: Root): void;
+  /** Re-enter hydration of one container, starting after `marker`. */
+  beginScope(parent: Root | Instance, marker: Instance): void;
+  /** End a scoped pass; nodes it did not claim stay where they are. */
+  endScope(): void;
 }
 
 /**
@@ -236,21 +275,48 @@ interface RenderContext<Root, Instance> {
   /** Re-render the root (a no-op for the HTML target). */
   rerender: () => void;
   /**
-   * A boundary is waiting on this thenable. The DOM root retries once it
-   * settles; the HTML target cannot wait, so it keeps the fallback.
+   * A boundary is waiting on this thenable. `retry` re-renders just that
+   * boundary (or the root, when the boundary was never in server markup).
    */
-  onSuspend: (thenable: Thenable) => void;
+  onSuspend: (thenable: Thenable, retry: () => void) => void;
   /** Set only by server targets that can complete a boundary later. */
   boundaries: BoundaryTracker<Root, Instance> | null;
   /** Report an error a boundary swallowed, without failing the whole tree. */
   onError?: (error: Any) => void;
+  /** Set only while a pass reuses markup instead of creating nodes. */
+  hydrating: boolean;
+  hydration: HydrationConfig<Root, Instance> | null;
+  /** Thenables found mid-hydration; they are reported only after the pass ends. */
+  deferred: DeferredSuspension[] | null;
+  /** Host properties claimed by a hydrating pass, applied only if it commits. */
+  pendingProps: PendingProperties<Instance>[] | null;
+  /** Full passes so far, so a retry armed by an old tree cannot touch a newer one. */
+  pass: number;
 }
+
+interface DeferredSuspension {
+  thenable: Thenable;
+  retry: () => void;
+  /** The content scope that armed the retry, so a later replacement can drop it. */
+  key: string;
+}
+
+interface PendingProperties<Instance> {
+  instance: Instance;
+  properties: NormalizedProperties;
+  /** The element's path, so a suspended attempt drops only its own work. */
+  key: string;
+}
+
+/** The element tree and the server markup cannot be lined up node for node. */
+class HydrationMismatchError extends Error {}
 
 function renderPass<Root, Instance>(
   context: RenderContext<Root, Instance>,
   element: Any,
   parent: Root | Instance,
 ): void {
+  context.pass++;
   context.scope = { key: "root", index: 0 };
   context.rendered.clear();
   if (context.boundaries !== null) context.boundaries.parent = null;
@@ -336,13 +402,13 @@ function renderNode<Root, Instance>(
 
   switch (typeof node) {
     case "string":
-      context.host.appendChild(parent, context.host.createTextInstance(node));
+      renderText(context, parent, node);
       return;
     case "number":
-      context.host.appendChild(parent, context.host.createTextInstance("" + node));
+      renderText(context, parent, "" + node);
       return;
     case "bigint":
-      context.host.appendChild(parent, context.host.createTextInstance(String(node)));
+      renderText(context, parent, String(node));
       return;
     case "symbol":
       throw new Error("Symbols are not valid as a React child.");
@@ -355,6 +421,37 @@ function renderNode<Root, Instance>(
     return;
   }
   throw new Error("Objects are not valid as a React child (found: " + describe(node) + ").");
+}
+
+/** Text either becomes a node or has to match the one the server left behind. */
+function renderText<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  text: string,
+): void {
+  if (!context.hydrating) {
+    context.host.appendChild(parent, context.host.createTextInstance(text));
+    return;
+  }
+  if (claimNode(context, parent, "text").value !== text) {
+    // A different string means every following node is out of alignment too.
+    throw new HydrationMismatchError();
+  }
+}
+
+/** Take the next server node when it has the expected kind, or abandon hydration. */
+function claimNode<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  kind: "element" | "text" | "comment",
+): HydrationNode<Instance> {
+  const hydration = context.hydration;
+  const node = hydration === null ? null : hydration.next(parent);
+  if (hydration === null || node === null || node.kind !== kind) {
+    throw new HydrationMismatchError();
+  }
+  hydration.accept(parent, node);
+  return node;
 }
 
 /** A child's identity among its siblings: its key, or its ordinal when unkeyed. */
@@ -413,19 +510,33 @@ function renderHostElement<Root, Instance>(
   segment: string,
   parent: Root | Instance,
 ): void {
-  const instance = context.host.createInstance(tag);
   const properties = normalizeProperties(props);
+  let instance: Instance;
+  if (context.hydrating) {
+    const node = claimNode(context, parent, "element");
+    if (node.value !== tag) throw new HydrationMismatchError();
+    instance = node.instance;
+  } else {
+    instance = context.host.createInstance(tag);
+  }
 
   // The tag is part of the path, so replacing this element remounts its children.
-  renderInScope(context, context.scope.key + "/" + tag + segment, () => {
+  const elementKey = context.scope.key + "/" + tag + segment;
+  renderInScope(context, elementKey, () => {
     if (properties.innerHTML !== null) {
       // `dangerouslySetInnerHTML` wins over children.
-      context.host.setInnerHTML(instance, properties.innerHTML);
+      // Hydration trusts the server's HTML, so it stays untouched.
+      if (!context.hydrating) context.host.setInnerHTML(instance, properties.innerHTML);
     } else {
       renderNode(context, props.children, instance);
     }
   });
 
+  if (context.hydrating) {
+    // Applied only if the attempt commits, so a retry cannot bind listeners twice.
+    context.pendingProps?.push({ instance, properties, key: elementKey });
+    return;
+  }
   context.host.setInitialProperties(instance, properties);
   context.host.appendChild(parent, instance);
 }
@@ -468,6 +579,8 @@ function renderComponent<Root, Instance>(
   });
 }
 
+// ---- Suspense boundaries ---------------------------------------------------
+
 /**
  * Children render into a staging root, so a subtree that suspends halfway
  * leaves no trace. The fallback takes its place until the root is retried.
@@ -480,43 +593,46 @@ function renderSuspense<Root, Instance>(
 ): void {
   const boundaryKey = context.scope.key + "/Suspense" + segment;
   const contentKey = boundaryKey + ":content";
+  const fallbackKey = boundaryKey + ":fallback";
+
+  if (context.hydrating) {
+    hydrateSuspense(context, props, contentKey, fallbackKey, parent);
+    return;
+  }
+
   const tracker = context.boundaries;
-  const id = tracker === null ? 0 : tracker.idFor(boundaryKey);
+  if (tracker === null) {
+    renderSuspenseContent(context, props, contentKey, fallbackKey, parent);
+    return;
+  }
+
+  const id = tracker.idFor(boundaryKey);
 
   // The start marker is written before the outcome is known, so a suspension
   // can turn it into `$?` without moving what precedes it.
-  const start = tracker === null ? null : context.host.createCommentInstance("$");
-  if (start !== null) context.host.appendChild(parent, start);
+  const start = context.host.createCommentInstance("$");
+  context.host.appendChild(parent, start);
 
   let staged: Root | Instance;
   try {
-    staged = renderBoundaryChildren(context, props, contentKey, id);
+    staged = renderBoundaryChildren(context, props.children, contentKey, id);
   } catch (thrown) {
-    if (tracker === null) {
-      if (!isThenable(thrown)) throw thrown;
-
-      // The attempt never committed, but the retry enters at the same keys and
-      // should find the hooks it already mounted.
-      retainScope(context, contentKey);
-      context.onSuspend(thrown);
-      renderBoundaryFallback(context, props, boundaryKey, parent);
-      return;
-    }
-
     retainScope(context, contentKey);
 
     if (isThenable(thrown)) {
-      context.host.setCommentText(start as Instance, "$?");
+      context.host.setCommentText(start, "$?");
       context.host.appendChild(parent, createBoundaryTemplate(context, id, null));
-      renderBoundaryFallback(context, props, boundaryKey, parent);
+      renderBoundaryFallback(context, props.fallback, fallbackKey, parent);
       context.host.appendChild(parent, context.host.createCommentInstance("/$"));
-      tracker.postpone(id, thrown, () => renderBoundaryChildren(context, props, contentKey, id));
+      tracker.postpone(id, thrown, () =>
+        renderBoundaryChildren(context, props.children, contentKey, id),
+      );
     } else {
       // The boundary cannot recover on the client either, so its fallback is
       // the final output and the error only goes to `onError`.
-      context.host.setCommentText(start as Instance, "$!");
+      context.host.setCommentText(start, "$!");
       context.host.appendChild(parent, createBoundaryTemplate(context, id, thrown));
-      renderBoundaryFallback(context, props, boundaryKey, parent);
+      renderBoundaryFallback(context, props.fallback, fallbackKey, parent);
       context.host.appendChild(parent, context.host.createCommentInstance("/$"));
       context.onError?.(thrown);
       tracker.finish(id);
@@ -525,49 +641,69 @@ function renderSuspense<Root, Instance>(
   }
 
   context.host.commitStaged(parent, staged);
-  if (tracker !== null) {
-    context.host.appendChild(parent, context.host.createCommentInstance("/$"));
-    tracker.finish(id);
+  context.host.appendChild(parent, context.host.createCommentInstance("/$"));
+  tracker.finish(id);
+}
+
+/** The client path: no markers, and a suspension leaves the fallback in place. */
+function renderSuspenseContent<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+): void {
+  let staged: Root | Instance;
+  try {
+    staged = renderBoundaryChildren(context, props.children, contentKey, 0);
+  } catch (thrown) {
+    if (!isThenable(thrown)) throw thrown;
+    retainScope(context, contentKey);
+    renderBoundaryFallback(context, props.fallback, fallbackKey, parent);
+    // Without markers there is no range to replace, so the root is the unit.
+    suspend(context, thrown, context.rerender, contentKey);
+    return;
   }
+  context.host.commitStaged(parent, staged);
 }
 
 /** Render the boundary's children into a detached root, naming `id` as their parent. */
 function renderBoundaryChildren<Root, Instance>(
   context: RenderContext<Root, Instance>,
-  props: Any,
+  children: Any,
   contentKey: string,
   id: number,
 ): Root | Instance {
   const tracker = context.boundaries;
   const previous = tracker === null ? null : tracker.parent;
   if (tracker !== null) tracker.parent = id;
-  const staged = context.host.createStagingRoot();
   try {
+    const staged = context.host.createStagingRoot();
     renderInScope(context, contentKey, () => {
-      renderNode(context, props.children, staged);
+      renderNode(context, children, staged);
     });
+    return staged;
   } finally {
     if (tracker !== null) tracker.parent = previous;
   }
-  return staged;
 }
 
 /** Fallbacks are already in the document, so a boundary inside one can stream at once. */
 function renderBoundaryFallback<Root, Instance>(
   context: RenderContext<Root, Instance>,
-  props: Any,
-  boundaryKey: string,
+  fallback: Any,
+  fallbackKey: string,
   parent: Root | Instance,
 ): void {
   const tracker = context.boundaries;
   const previous = tracker === null ? null : tracker.parent;
   if (tracker !== null) tracker.parent = null;
   try {
-    const fallbackStage = context.host.createStagingRoot();
-    renderInScope(context, boundaryKey + ":fallback", () => {
-      renderNode(context, props.fallback, fallbackStage);
-      context.host.commitStaged(parent, fallbackStage);
+    const staged = context.host.createStagingRoot();
+    renderInScope(context, fallbackKey, () => {
+      renderNode(context, fallback, staged);
     });
+    context.host.commitStaged(parent, staged);
   } finally {
     if (tracker !== null) tracker.parent = previous;
   }
@@ -602,6 +738,419 @@ function retainScope<Root, Instance>(
   }
 }
 
+// ---- Suspension bookkeeping ------------------------------------------------
+
+/**
+ * Report a suspension to the host. Hydration collects them instead, because a
+ * synchronous settlement would otherwise re-enter the walk that is still
+ * claiming nodes.
+ */
+function suspend<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  thenable: Thenable,
+  retry: () => void,
+  key: string,
+): void {
+  if (context.deferred !== null) context.deferred.push({ thenable, retry, key });
+  else context.onSuspend(thenable, retry);
+}
+
+/** Keep the server markup and retry this boundary when `thenable` settles. */
+function suspendBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  contentKey: string,
+  thenable: Thenable,
+  retry: () => void,
+): void {
+  retainScope(context, contentKey);
+  const pass = context.pass;
+  suspend(
+    context,
+    thenable,
+    () => {
+      /** A retry only runs while the tree that armed it is still the current one. */
+      if (context.pass === pass) retry();
+    },
+    contentKey,
+  );
+}
+
+/** Forget retries armed by a subtree that is about to be replaced wholesale. */
+function dropDeferred<Root, Instance>(context: RenderContext<Root, Instance>, key: string): void {
+  const deferred = context.deferred;
+  if (deferred === null) return;
+  const prefix = key + "/";
+  for (let i = deferred.length - 1; i >= 0; i--) {
+    const armed = deferred[i].key;
+    if (armed === key || armed.startsWith(prefix)) deferred.splice(i, 1);
+  }
+}
+
+/** Apply the host work of an attempt that committed. */
+function applyPendingProperties<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  queued: PendingProperties<Instance>[],
+): void {
+  for (const { instance, properties } of queued) {
+    context.host.setInitialProperties(instance, properties);
+  }
+}
+
+/** Drop the host work of an attempt that suspended or mismatched. */
+function dropPendingProps<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  key: string,
+): void {
+  const queued = context.pendingProps;
+  if (queued === null) return;
+  const prefix = key + "/";
+  for (let i = queued.length - 1; i >= 0; i--) {
+    if (queued[i].key.startsWith(prefix)) queued.splice(i, 1);
+  }
+}
+
+// ---- Hydrating a boundary --------------------------------------------------
+
+/** What one scoped hydration attempt achieved. */
+type BoundaryAttempt<Instance> =
+  | { status: "hydrated"; queued: PendingProperties<Instance>[] }
+  | { status: "suspended"; thenable: Thenable }
+  | { status: "mismatched" };
+
+/** What rendering the content detached from the document achieved. */
+type ContentProbe<Root, Instance> =
+  | { status: "ready"; staged: Root | Instance }
+  | { status: "suspended"; thenable: Thenable }
+  | { status: "threw"; error: Any };
+
+/**
+ * Server markup for a boundary has three shapes: content (`$`), a placeholder
+ * (`$?`/`$~`), or a permanent fallback (`$!`). `renderToString` writes no
+ * markers, so its content sits directly in the parent.
+ */
+function hydrateSuspense<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+): void {
+  const marker = peekMarker(context, parent);
+
+  switch (marker) {
+    case null:
+      try {
+        renderInScope(context, contentKey, () => {
+          renderNode(context, props.children, parent);
+        });
+      } catch (thrown) {
+        if (thrown instanceof HydrationMismatchError) throw thrown;
+        throw new HydrationMismatchError();
+      }
+      return;
+    case "$":
+      hydrateCompletedBoundary(context, props, contentKey, fallbackKey, parent);
+      return;
+    case "$?":
+    case "$~":
+      hydratePostponedBoundary(context, props, contentKey, fallbackKey, parent, marker);
+      return;
+    case "$!":
+      hydrateFailedBoundary(context, props, contentKey, fallbackKey, parent);
+      return;
+    default:
+      throw new HydrationMismatchError();
+  }
+}
+
+/** The server rendered the content; hydrate it, or keep it for a later retry. */
+function hydrateCompletedBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+): void {
+  const start = acceptMarker(context, parent, "$");
+  try {
+    renderInScope(context, contentKey, () => {
+      renderNode(context, props.children, parent);
+    });
+    acceptMarker(context, parent, "/$");
+  } catch (thrown) {
+    dropPendingProps(context, contentKey);
+    skipUntilEndMarker(context, parent);
+    const end = acceptMarker(context, parent, "/$");
+    // A suspension is not a mismatch: the server's content is the right
+    // content, the client just cannot hydrate it yet.
+    if (isThenable(thrown)) {
+      suspendBoundary(context, contentKey, thrown, () =>
+        retryBoundaryHydration(context, props, contentKey, fallbackKey, parent, start, end),
+      );
+      return;
+    }
+    clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end);
+  }
+}
+
+/**
+ * The server never sent this content. A detached attempt learns what the
+ * boundary is waiting for, while the server's fallback stays untouched.
+ */
+function hydratePostponedBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+  marker: string,
+): void {
+  const start = acceptMarker(context, parent, marker);
+  skipElement(context, parent, "template");
+  skipUntilEndMarker(context, parent);
+  const end = acceptMarker(context, parent, "/$");
+
+  const probe = probeBoundaryContent(context, props.children, contentKey);
+  if (probe.status === "suspended") {
+    // The fallback is already on screen; only the content is missing. If Fizz
+    // revealed content in the meantime, hydration is still preferable.
+    suspendBoundary(context, contentKey, probe.thenable, () =>
+      retryBoundaryHydration(context, props, contentKey, fallbackKey, parent, start, end),
+    );
+    return;
+  }
+  if (probe.status === "threw") throw probe.error;
+
+  // The client already has the content, so replace the server's placeholder.
+  commitBoundaryRange(context, parent, start, end, probe.staged);
+}
+
+/** `$!` means the server gave up; React retries that boundary on the client. */
+function hydrateFailedBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+): void {
+  const start = acceptMarker(context, parent, "$!");
+  skipElement(context, parent, "template");
+  skipUntilEndMarker(context, parent);
+  const end = acceptMarker(context, parent, "/$");
+  clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end);
+}
+
+/**
+ * Client-render one boundary between its markers. The rest of the hydrated
+ * tree is untouched, so a late settlement never rebuilds the root. The
+ * markers stay so a later retry can replace the same range again.
+ */
+function clientRenderBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+  start: Instance,
+  end: Instance,
+): void {
+  const wasHydrating = context.hydrating;
+  context.hydrating = false;
+  // The subtree is rebuilt, so retries armed by the version being replaced are void.
+  dropDeferred(context, contentKey);
+  try {
+    const probe = probeBoundaryContent(context, props.children, contentKey);
+    if (probe.status === "ready") {
+      commitBoundaryRange(context, parent, start, end, probe.staged);
+      return;
+    }
+    if (probe.status === "threw") throw probe.error;
+
+    // The content is not ready, so the fallback fills the range until it is.
+    const fallback = context.host.createStagingRoot();
+    renderInScope(context, fallbackKey, () => {
+      renderNode(context, props.fallback, fallback);
+    });
+    commitBoundaryRange(context, parent, start, end, fallback);
+    // Last, so a synchronous settlement cannot re-enter this frame.
+    suspendBoundary(context, contentKey, probe.thenable, () =>
+      clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end),
+    );
+  } finally {
+    context.hydrating = wasHydrating;
+  }
+}
+
+/** Render the content detached, so an attempt can be thrown away untouched. */
+function probeBoundaryContent<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  children: Any,
+  contentKey: string,
+): ContentProbe<Root, Instance> {
+  const wasHydrating = context.hydrating;
+  context.hydrating = false;
+  try {
+    const staged = renderBoundaryChildren(context, children, contentKey, 0);
+    return { status: "ready", staged };
+  } catch (thrown) {
+    if (isThenable(thrown)) return { status: "suspended", thenable: thrown };
+    return { status: "threw", error: thrown };
+  } finally {
+    context.hydrating = wasHydrating;
+  }
+}
+
+/**
+ * Claim a boundary's content again, starting after its start marker. The DOM
+ * is read fresh, so content Fizz revealed after the first pass is included.
+ */
+function attemptBoundaryHydration<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  children: Any,
+  contentKey: string,
+  parent: Root | Instance,
+  start: Instance,
+): BoundaryAttempt<Instance> {
+  const hydration = context.hydration;
+  if (hydration === null) return { status: "mismatched" };
+
+  hydration.beginScope(parent, start);
+  const queued: PendingProperties<Instance>[] = [];
+  const wasHydrating = context.hydrating;
+  const wasPending = context.pendingProps;
+  context.hydrating = true;
+  context.pendingProps = queued;
+  try {
+    try {
+      renderInScope(context, contentKey, () => {
+        renderNode(context, children, parent);
+      });
+      acceptMarker(context, parent, "/$");
+      return { status: "hydrated", queued };
+    } catch (thrown) {
+      // A wakeable only means the data is late; anything else is a mismatch.
+      if (isThenable(thrown)) return { status: "suspended", thenable: thrown };
+      return { status: "mismatched" };
+    }
+  } finally {
+    context.hydrating = wasHydrating;
+    context.pendingProps = wasPending;
+    hydration.endScope();
+  }
+}
+
+/**
+ * Retry a boundary whose server content is still on screen. Hydration is
+ * re-entered in place; only content that cannot match the markup is rebuilt.
+ */
+function retryBoundaryHydration<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  props: Any,
+  contentKey: string,
+  fallbackKey: string,
+  parent: Root | Instance,
+  start: Instance,
+  end: Instance,
+): void {
+  if (context.hydration !== null && context.host.getCommentText(start) === "$") {
+    const attempt = attemptBoundaryHydration(context, props.children, contentKey, parent, start);
+    if (attempt.status === "hydrated") {
+      applyPendingProperties(context, attempt.queued);
+      return;
+    }
+    if (attempt.status === "suspended") {
+      // Still not ready. The markup is untouched, so try hydration again later.
+      suspendBoundary(context, contentKey, attempt.thenable, () =>
+        retryBoundaryHydration(context, props, contentKey, fallbackKey, parent, start, end),
+      );
+      return;
+    }
+  }
+
+  // Either there is no markup to reuse (`$?`/`$~`) or hydration cannot match
+  // what the server sent, so only a client render can settle this boundary.
+  clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end);
+}
+
+/** Replace whatever sits between a boundary's markers with `staged`. */
+function commitBoundaryRange<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  start: Instance,
+  end: Instance,
+  staged: Root | Instance,
+): void {
+  context.host.clearBetween(parent, start, end);
+  context.host.commitStaged(parent, staged, end);
+}
+
+// ---- Hydration markers -----------------------------------------------------
+
+function peekMarker<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+): string | null {
+  const hydration = context.hydration;
+  const node = hydration === null ? null : hydration.next(parent);
+  return node !== null && node.kind === "comment" ? node.value : null;
+}
+
+function acceptMarker<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  value: string,
+): Instance {
+  const hydration = context.hydration;
+  const node = hydration === null ? null : hydration.next(parent);
+  if (hydration === null || node === null || node.kind !== "comment" || node.value !== value) {
+    throw new HydrationMismatchError();
+  }
+  hydration.accept(parent, node);
+  return node.instance;
+}
+
+/** Leave a node where the server put it and step over it. */
+function skipElement<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  tag: string,
+): void {
+  const hydration = context.hydration;
+  const node = hydration === null ? null : hydration.next(parent);
+  if (hydration === null || node === null || node.kind !== "element" || node.value !== tag) {
+    throw new HydrationMismatchError();
+  }
+  hydration.skip(parent, node);
+}
+
+/** Advance to the boundary's end marker without touching the nodes it skips. */
+function skipUntilEndMarker<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+): void {
+  const hydration = context.hydration;
+  if (hydration === null) throw new HydrationMismatchError();
+
+  let depth = 0;
+  for (let node = hydration.next(parent); node !== null; node = hydration.next(parent)) {
+    if (node.kind === "comment") {
+      if (node.value === "/$") {
+        if (depth === 0) return;
+        depth--;
+        hydration.skip(parent, node);
+        continue;
+      }
+      if (isBoundaryStart(node.value)) depth++;
+    }
+    hydration.skip(parent, node);
+  }
+  throw new HydrationMismatchError();
+}
+
+function isBoundaryStart(data: string): boolean {
+  return data === "$" || data === "$?" || data === "$~" || data === "$!";
+}
+
 // ---- The public renderer ---------------------------------------------------
 
 export interface RendererOptions<Root, Instance> {
@@ -611,14 +1160,16 @@ export interface RendererOptions<Root, Instance> {
   onError?: (error: Any) => void;
   /** Re-render the root after a state update; the DOM target supplies one. */
   rerender?: () => void;
-  /** A boundary suspended; the DOM target retries once it settles. */
-  onSuspend?: (thenable: Thenable) => void;
+  /** A boundary suspended; `retry` re-renders the boundary (or the root) later. */
+  onSuspend?: (thenable: Thenable, retry: () => void) => void;
 }
 
 /** One host-bound walker. Every pass reuses the hook instances it mounted. */
 export interface Renderer<Root> {
   /** Fill a fresh root with `element`. */
   render(element: Any): Root;
+  /** Fill `root`, reusing the markup its host already holds where possible. */
+  hydrate(element: Any, root: Root): void;
   /** Drop every mounted instance, so the next pass mounts fresh. */
   reset(): void;
 }
@@ -640,12 +1191,60 @@ export function createRenderer<Root, Instance>(
     onSuspend: options.onSuspend ?? noop,
     boundaries: options.boundaries ?? null,
     onError: options.onError,
+    hydrating: false,
+    hydration: host.hydration ?? null,
+    deferred: null,
+    pendingProps: null,
+    pass: 0,
   };
   return {
     render(element) {
       const root = host.createRoot();
       renderPass(context, element, root);
       return root;
+    },
+    hydrate(element, root) {
+      const hydration = context.hydration;
+      if (hydration === null) throw new Error("This target cannot hydrate.");
+
+      /** Settled retries wait until the pass stops claiming nodes. */
+      const suspended: DeferredSuspension[] = [];
+      /** Listeners and attributes are applied only if this attempt commits. */
+      const queued: PendingProperties<Instance>[] = [];
+      let committed = false;
+
+      hydration.begin(root);
+      context.hydrating = true;
+      context.deferred = suspended;
+      context.pendingProps = queued;
+      try {
+        try {
+          renderPass(context, element, root);
+          committed = true;
+        } catch (error) {
+          if (!(error instanceof HydrationMismatchError)) throw error;
+
+          // The markup cannot be lined up with the tree, so the client takes
+          // the root over. Hooks and host work from the attempt must not
+          // survive, and neither do the retries it armed.
+          suspended.length = 0;
+          queued.length = 0;
+          context.instances.clear();
+          context.rendered.clear();
+          context.hydrating = false;
+          hydration.clear(root);
+          renderPass(context, element, root);
+        }
+      } finally {
+        context.hydrating = false;
+        context.deferred = null;
+        context.pendingProps = null;
+        hydration.finish(root);
+      }
+
+      // The markup is settled now, so a retry may safely replace the tree.
+      if (committed) applyPendingProperties(context, queued);
+      for (const { thenable, retry } of suspended) context.onSuspend(thenable, retry);
     },
     reset() {
       context.instances.clear();
