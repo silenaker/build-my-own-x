@@ -63,10 +63,20 @@ export interface PatchConfig<Root, Instance> {
   updateText(instance: Instance, text: string): void;
   /** The pass emitted its last child of `parent`; drop whatever is left over. */
   finishChildren(parent: Root | Instance): void;
-  /** End the pass, forgetting the keys it did not reach. */
-  end(): void;
+  /** End the pass; only keys under `prefix` are forgotten, or all of them without one. */
+  end(prefix?: string): void;
   /** Forget every key, so the root renders from scratch again. */
   reset(): void;
+  /** The index in `parent` where the pass's next child will go. */
+  position(parent: Root | Instance): number;
+  /** Resume placing children of `parent` at `index`, so a scoped pass keeps its slot. */
+  positionAt(parent: Root | Instance, index: number): void;
+  /** The index of `instance` among the children of `parent`, or -1 when it moved away. */
+  positionOf(parent: Root | Instance, instance: Instance): number;
+  /** The children of `parent` the pass placed between `start` and the current cursor. */
+  nodesBetween(parent: Root | Instance, start: number): Instance[];
+  /** Drop one node a scoped pass no longer emits. */
+  remove(parent: Root | Instance, instance: Instance): void;
 }
 
 /** One server node a hydrating container still has to match. */
@@ -140,12 +150,24 @@ interface ComponentInstance {
   hooks: HookSlot[];
   /** Ordinal of the next hook call. */
   hookIndex: number;
-  /** Re-render the root. */
+  /** Apply this component's queued state, without re-rendering the root. */
   rerender: () => void;
   /** The component the hooks belong to; another one at the same slot mounts fresh. */
   type: Any;
   /** Distinguishes one mounted instance from the next one at the same slot. */
   id: number;
+  /** Path of this component in the instance map, so a pass can prune only its subtree. */
+  key: string;
+  /** Props of the last committed render; a state update re-runs the component with them. */
+  props: Any;
+  /** Scope depth, so coalesced updates run ancestors before descendants. */
+  depth: number;
+  /** Scope the output was rendered in; keys inside it stay stable across updates. */
+  outputKey: string;
+  /** Host parent the output was committed to, or `null` while it has no stable location. */
+  parent: Any;
+  /** Nodes the committed output occupies, or `null` when only a root pass can locate it. */
+  output: Any[] | null;
 }
 
 let currentInstance: ComponentInstance | null = null;
@@ -287,6 +309,8 @@ interface RenderScope {
   key: string;
   /** Ordinal of the next child here; every child consumes one. */
   index: number;
+  /** Distance from the root; a component update uses it to run ancestors first. */
+  depth: number;
 }
 
 interface RenderContext<Root, Instance> {
@@ -319,6 +343,10 @@ interface RenderContext<Root, Instance> {
   pendingProps: PendingProperties<Instance>[] | null;
   /** Full passes so far, so a retry armed by an old tree cannot touch a newer one. */
   pass: number;
+  /** Apply one component's queued state, either in place or as part of a root pass. */
+  schedule: (instance: ComponentInstance) => void;
+  /** Nesting depth of staging roots; output rendered there has no stable location yet. */
+  staging: number;
 }
 
 interface DeferredSuspension {
@@ -344,7 +372,7 @@ function renderPass<Root, Instance>(
   parent: Root | Instance,
 ): void {
   context.pass++;
-  context.scope = { key: "root", index: 0 };
+  context.scope = { key: "root", index: 0, depth: 0 };
   context.rendered.clear();
   if (context.boundaries !== null) context.boundaries.parent = null;
   context.patch?.begin();
@@ -381,7 +409,7 @@ function renderInScope<Root, Instance>(
   render: () => void,
 ): void {
   const outer = context.scope;
-  context.scope = { key, index: 0 };
+  context.scope = { key, index: 0, depth: outer.depth + 1 };
   try {
     render();
   } finally {
@@ -407,9 +435,17 @@ function getInstance<Root, Instance>(
       id: nextInstanceId++,
       hooks: [],
       hookIndex: 0,
-      rerender: context.rerender,
+      key,
+      props: null,
+      depth: 0,
+      outputKey: "",
+      parent: null,
+      output: null,
+      rerender: noop,
     };
     context.instances.set(key, instance);
+    // The instance closes over itself, so a dispatch marks exactly this slot.
+    instance.rerender = () => context.schedule(instance as ComponentInstance);
   }
   return instance;
 }
@@ -627,6 +663,34 @@ function renderComponent<Root, Instance>(
   }
 
   const instance = getInstance(context, component, segment);
+  const output = invokeComponent(instance, component, props);
+
+  const outputKey = context.scope.key + "/" + segment + "@" + instance.id;
+  instance.props = props;
+  instance.depth = context.scope.depth;
+  instance.outputKey = outputKey;
+
+  const patch = context.patch;
+  // Only a settled pass into a real parent can name the nodes an update will replace.
+  if (patch !== null && !context.hydrating && context.staging === 0) {
+    instance.parent = parent;
+    const start = patch.position(parent);
+    renderInScope(context, outputKey, () => {
+      renderNode(context, output, parent);
+    });
+    instance.output = patch.nodesBetween(parent, start);
+    return;
+  }
+
+  // A staged or hydrating subtree may still move, so an update has to use the root.
+  instance.output = null;
+  renderInScope(context, outputKey, () => {
+    renderNode(context, output, parent);
+  });
+}
+
+/** Run the component with its hooks bound to `instance`. */
+function invokeComponent(instance: ComponentInstance, component: Any, props: Any): Any {
   const previousDispatcher = ReactSharedInternals.currentDispatcher;
   const previousInstance = currentInstance;
 
@@ -647,10 +711,76 @@ function renderComponent<Root, Instance>(
       "Rendered fewer hooks than expected. This is probably caused by an early return statement.",
     );
   }
+  return output;
+}
 
-  renderInScope(context, context.scope.key + "/" + segment + "@" + instance.id, () => {
-    renderNode(context, output, parent);
-  });
+/** What a targeted update achieved, so the scheduler knows whether it still owes work. */
+type UpdateResult = "rendered" | "stale" | "fallback";
+
+/**
+ * Re-run one component where its output already sits. Only that output range is
+ * re-placed and pruned, so ancestors, siblings and their DOM stay untouched.
+ */
+function renderComponentUpdate<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  instance: ComponentInstance,
+): UpdateResult {
+  if (context.instances.get(instance.key) !== instance) {
+    // The component was unmounted; its queued state belongs to nothing now.
+    return "stale";
+  }
+
+  const patch = context.patch;
+  const parent = instance.parent as Root | Instance | null;
+  const previous = instance.output;
+  if (patch === null || parent === null || previous === null || previous.length === 0) {
+    // No settled range was recorded, so only a root pass can find the output again.
+    return "fallback";
+  }
+
+  const start = patch.positionOf(parent, previous[0] as Instance);
+  if (start === -1) {
+    // The anchor moved out from under us; the root pass re-establishes the tree.
+    return "fallback";
+  }
+
+  context.pass++;
+  context.rendered.clear();
+  context.rendered.add(instance.key);
+  context.scope = { key: instance.outputKey, index: 0, depth: instance.depth + 1 };
+  patch.begin();
+  patch.positionAt(parent, start);
+  try {
+    try {
+      const output = invokeComponent(instance, instance.type, instance.props);
+      renderNode(context, output, parent);
+    } catch (thrown) {
+      // The boundary that could catch this is not on the stack of a scoped pass.
+      if (isThenable(thrown)) {
+        throw new Error(
+          "A component suspended while rendering synchronously, but no <Suspense> boundary " +
+            "was found. Await the tree first (e.g. `await deepAwait(root)`) before rendering it.",
+        );
+      }
+      throw thrown;
+    }
+
+    const next = patch.nodesBetween(parent, start);
+    // A node the component no longer emits would otherwise leave duplicated output.
+    for (const node of previous) {
+      if (!next.includes(node)) patch.remove(parent, node as Instance);
+    }
+    instance.output = next;
+  } finally {
+    patch.end(instance.outputKey + "/");
+  }
+
+  // Components the pass did not reach went away with the replaced output.
+  const prefix = instance.outputKey + "/";
+  for (const key of [...context.instances.keys()]) {
+    if (key.startsWith(prefix) && !context.rendered.has(key)) context.instances.delete(key);
+  }
+  return "rendered";
 }
 
 // ---- Suspense boundaries ---------------------------------------------------
@@ -753,9 +883,14 @@ function renderBoundaryChildren<Root, Instance>(
   if (tracker !== null) tracker.parent = id;
   try {
     const staged = context.host.createStagingRoot();
-    renderInScope(context, contentKey, () => {
-      renderNode(context, children, staged);
-    });
+    context.staging++;
+    try {
+      renderInScope(context, contentKey, () => {
+        renderNode(context, children, staged);
+      });
+    } finally {
+      context.staging--;
+    }
     return staged;
   } finally {
     if (tracker !== null) tracker.parent = previous;
@@ -774,9 +909,14 @@ function renderBoundaryFallback<Root, Instance>(
   if (tracker !== null) tracker.parent = null;
   try {
     const staged = context.host.createStagingRoot();
-    renderInScope(context, fallbackKey, () => {
-      renderNode(context, fallback, staged);
-    });
+    context.staging++;
+    try {
+      renderInScope(context, fallbackKey, () => {
+        renderNode(context, fallback, staged);
+      });
+    } finally {
+      context.staging--;
+    }
     context.host.commitStaged(parent, staged);
   } finally {
     if (tracker !== null) tracker.parent = previous;
@@ -1042,9 +1182,14 @@ function clientRenderBoundary<Root, Instance>(
 
     // The content is not ready, so the fallback fills the range until it is.
     const fallback = context.host.createStagingRoot();
-    renderInScope(context, fallbackKey, () => {
-      renderNode(context, props.fallback, fallback);
-    });
+    context.staging++;
+    try {
+      renderInScope(context, fallbackKey, () => {
+        renderNode(context, props.fallback, fallback);
+      });
+    } finally {
+      context.staging--;
+    }
     commitBoundaryRange(context, parent, start, end, fallback);
     // Last, so a synchronous settlement cannot re-enter this frame.
     suspendBoundary(context, contentKey, probe.thenable, () =>
@@ -1256,11 +1401,20 @@ export function createRenderer<Root, Instance>(
   host: HostConfig<Root, Instance>,
   options: RendererOptions<Root, Instance> = {},
 ): Renderer<Root> {
+  /** Only a host that patches and a driver that can re-render support updates. */
+  const canUpdate = options.rerender !== undefined && (host.patch ?? null) !== null;
+  /** Components whose queued state still has to be applied. */
+  const dirty = new Set<ComponentInstance>();
+  /** Components that dispatched while a pass was running; that pass may cover them. */
+  const queuedDuringPass = new Set<ComponentInstance>();
+  let flushing = false;
+  let inPass = false;
+
   const context: RenderContext<Root, Instance> = {
     host,
     instances: new Map(),
     rendered: new Set(),
-    scope: { key: "root", index: 0 },
+    scope: { key: "root", index: 0, depth: 0 },
     rerender: options.rerender ?? noop,
     onSuspend: options.onSuspend ?? noop,
     boundaries: options.boundaries ?? null,
@@ -1271,12 +1425,72 @@ export function createRenderer<Root, Instance>(
     deferred: null,
     pendingProps: null,
     pass: 0,
+    schedule,
+    staging: 0,
   };
+
+  function schedule(instance: ComponentInstance): void {
+    if (!canUpdate) return;
+    dirty.add(instance);
+    if (flushing || inPass) {
+      // The running pass may already render this component, so decide afterwards.
+      queuedDuringPass.add(instance);
+      return;
+    }
+    flushUpdates();
+  }
+
+  /** The queued component closest to the root, so an ancestor pass absorbs its descendants. */
+  function shallowest(): ComponentInstance {
+    let next: ComponentInstance | null = null;
+    for (const candidate of dirty) {
+      if (next === null || candidate.depth < next.depth) next = candidate;
+    }
+    return next as ComponentInstance;
+  }
+
+  /** Keep only work the pass did not apply; the rest is already on screen. */
+  function settleQueued(): void {
+    for (const instance of [...dirty]) {
+      if (queuedDuringPass.has(instance)) continue;
+      const current = context.instances.get(instance.key) === instance;
+      if (!current || context.rendered.has(instance.key)) dirty.delete(instance);
+    }
+    queuedDuringPass.clear();
+  }
+
+  function flushUpdates(): void {
+    if (!canUpdate) return;
+    flushing = true;
+    try {
+      while (dirty.size > 0) {
+        const instance = shallowest();
+        dirty.delete(instance);
+        const result = renderComponentUpdate(context, instance);
+        if (result === "fallback") {
+          // Only a root pass can find output whose range was never recorded.
+          options.rerender?.();
+          continue;
+        }
+        settleQueued();
+      }
+    } finally {
+      flushing = false;
+    }
+  }
+
   return {
     render(element) {
-      const root = host.createRoot();
-      renderPass(context, element, root);
-      return root;
+      inPass = true;
+      try {
+        const root = host.createRoot();
+        renderPass(context, element, root);
+        return root;
+      } finally {
+        inPass = false;
+        settleQueued();
+        if (!flushing && dirty.size > 0) flushUpdates();
+      }
     },
     hydrate(element, root) {
       const hydration = context.hydration;
@@ -1288,40 +1502,49 @@ export function createRenderer<Root, Instance>(
       const queued: PendingProperties<Instance>[] = [];
       let committed = false;
 
-      hydration.begin(root);
-      context.hydrating = true;
-      context.deferred = suspended;
-      context.pendingProps = queued;
+      inPass = true;
       try {
+        hydration.begin(root);
+        context.hydrating = true;
+        context.deferred = suspended;
+        context.pendingProps = queued;
         try {
-          renderPass(context, element, root);
-          committed = true;
-        } catch (error) {
-          if (!(error instanceof HydrationMismatchError)) throw error;
+          try {
+            renderPass(context, element, root);
+            committed = true;
+          } catch (error) {
+            if (!(error instanceof HydrationMismatchError)) throw error;
 
-          // The markup cannot be lined up with the tree, so the client takes
-          // the root over. Hooks and host work from the attempt must not
-          // survive, and neither do the retries it armed.
-          suspended.length = 0;
-          queued.length = 0;
-          context.instances.clear();
-          context.rendered.clear();
+            // The markup cannot be lined up with the tree, so the client takes
+            // the root over. Hooks and host work from the attempt must not
+            // survive, and neither do the retries it armed.
+            suspended.length = 0;
+            queued.length = 0;
+            context.instances.clear();
+            context.rendered.clear();
+            context.hydrating = false;
+            hydration.clear(root);
+            renderPass(context, element, root);
+          }
+        } finally {
           context.hydrating = false;
-          hydration.clear(root);
-          renderPass(context, element, root);
+          context.deferred = null;
+          context.pendingProps = null;
+          hydration.finish(root);
         }
-      } finally {
-        context.hydrating = false;
-        context.deferred = null;
-        context.pendingProps = null;
-        hydration.finish(root);
-      }
 
-      // The markup is settled now, so a retry may safely replace the tree.
-      if (committed) applyPendingProperties(context, queued);
-      for (const { thenable, retry } of suspended) context.onSuspend(thenable, retry);
+        // The markup is settled now, so a retry may safely replace the tree.
+        if (committed) applyPendingProperties(context, queued);
+        for (const { thenable, retry } of suspended) context.onSuspend(thenable, retry);
+      } finally {
+        inPass = false;
+        settleQueued();
+        if (!flushing && dirty.size > 0) flushUpdates();
+      }
     },
     reset() {
+      dirty.clear();
+      queuedDuringPass.clear();
       context.instances.clear();
       context.rendered.clear();
       context.patch?.reset();

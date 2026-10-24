@@ -76,15 +76,31 @@ function createDomHost(document: Document, container: Element): HostConfig<Eleme
       reached.clear();
       placed.clear();
     },
-    end() {
+    end(prefix?: string) {
       patching = false;
       placed.clear();
       for (const key of mounted.keys()) {
+        // A scoped pass only owns the keys it could have rendered.
+        if (prefix !== undefined && !key.startsWith(prefix)) continue;
         if (!reached.has(key)) mounted.delete(key);
       }
       reached.clear();
     },
     claim: (key) => mounted.get(key) ?? null,
+    position: (parent) => placed.get(parent as Node) ?? 0,
+    positionAt: (parent, index) => {
+      placed.set(parent as Node, index);
+    },
+    positionOf: (parent, node) =>
+      [...(parent as Node).childNodes].indexOf(node as unknown as ChildNode),
+    nodesBetween: (parent, start) => {
+      const end = placed.get(parent as Node) ?? 0;
+      return [...(parent as Node).childNodes].slice(start, end);
+    },
+    remove: (parent, node) => {
+      const nodeParent = parent as Node;
+      if ((node as Node).parentNode === nodeParent) nodeParent.removeChild(node as Node);
+    },
     retain(key, node) {
       reached.add(key);
       mounted.set(key, node);

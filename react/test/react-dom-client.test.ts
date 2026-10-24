@@ -366,6 +366,162 @@ describe("component identity", () => {
   });
 });
 
+describe("targeted updates", () => {
+  function mountRoot(element: Any) {
+    const document = new TestDocument();
+    const container = document.createElement("root");
+    const root = createRoot(container as unknown as Element);
+    root.render(element);
+    return { container, root };
+  }
+
+  const click = (node: Any): void => asElement(node).dispatch("click", {});
+
+  it("re-renders only the component whose state changed", () => {
+    const calls = { app: 0, counter: 0, sibling: 0 };
+
+    function Counter() {
+      calls.counter++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "c" + count,
+      });
+    }
+    function Sibling() {
+      calls.sibling++;
+      return createElement("span", { children: "s" });
+    }
+    function App() {
+      calls.app++;
+      return createElement("div", {
+        children: [createElement(Counter, {}), createElement(Sibling, {})],
+      });
+    }
+
+    const { container } = mountRoot(createElement(App, {}));
+    expect(calls).toEqual({ app: 1, counter: 1, sibling: 1 });
+
+    click(asElement(container.childNodes[0]).childNodes[0]);
+
+    expect(calls).toEqual({ app: 1, counter: 2, sibling: 1 });
+    expect(container.textContent).toBe("c1s");
+  });
+
+  it("keeps a growing component's siblings in order", () => {
+    function Grow() {
+      const [count, setCount] = useState(1);
+      const items = [];
+      for (let i = 0; i < count; i++) items.push(createElement("i", { children: String(i) }));
+      return createElement("span", { onClick: () => setCount(count + 1), children: items });
+    }
+    function Other() {
+      const [count, setCount] = useState(0);
+      return createElement("b", { onClick: () => setCount(count + 1), children: "o" + count });
+    }
+
+    const { container } = mountRoot(
+      createElement("div", { children: [createElement(Grow, {}), createElement(Other, {})] }),
+    );
+    const div = asElement(container.childNodes[0]);
+
+    click(div.childNodes[0]);
+    click(div.childNodes[0]);
+    expect(div.textContent).toBe("012o0");
+    expect(asElement(div.childNodes[0]).childNodes).toHaveLength(3);
+
+    click(div.childNodes[1]);
+    expect(div.childNodes).toHaveLength(2);
+    expect(div.textContent).toBe("012o1");
+  });
+
+  it("targets the keyed component after its siblings move", () => {
+    function Counter({ label }: { label: string }) {
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: label + count,
+      });
+    }
+    const counter = (key: string) => createElement(Counter, { label: key }, key);
+
+    const { container, root } = mountRoot(
+      createElement("div", { children: [counter("x"), counter("y")] }),
+    );
+    const div = () => asElement(container.childNodes[0]);
+
+    click(div().childNodes[0]);
+    expect(container.textContent).toBe("x1y0");
+
+    root.render(createElement("div", { children: [counter("y"), counter("x")] }));
+    expect(container.textContent).toBe("y0x1");
+
+    click(div().childNodes[0]);
+    expect(container.textContent).toBe("y1x1");
+  });
+
+  it("prunes output a targeted component stops emitting", () => {
+    function Shrink() {
+      const [count, setCount] = useState(3);
+      const items = [];
+      for (let i = 0; i < count; i++) items.push(createElement("i", { children: String(i) }));
+      return createElement("span", { onClick: () => setCount(0), children: items });
+    }
+    function Other() {
+      const [count, setCount] = useState(0);
+      return createElement("b", { onClick: () => setCount(count + 1), children: "o" + count });
+    }
+
+    const { container } = mountRoot(
+      createElement("div", { children: [createElement(Shrink, {}), createElement(Other, {})] }),
+    );
+    const div = asElement(container.childNodes[0]);
+    expect(div.textContent).toBe("012o0");
+
+    click(div.childNodes[0]);
+    expect(div.textContent).toBe("o0");
+    expect(asElement(div.childNodes[0]).childNodes).toHaveLength(0);
+
+    click(div.childNodes[1]);
+    expect(div.childNodes).toHaveLength(2);
+    expect(div.textContent).toBe("o1");
+  });
+
+  it("updates sibling components independently", () => {
+    const calls = { a: 0, b: 0 };
+
+    function A() {
+      calls.a++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "a" + count,
+      });
+    }
+    function B() {
+      calls.b++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "b" + count,
+      });
+    }
+
+    const { container } = mountRoot(
+      createElement("div", { children: [createElement(A, {}), createElement(B, {})] }),
+    );
+    const div = asElement(container.childNodes[0]);
+
+    click(div.childNodes[0]);
+    expect(calls).toEqual({ a: 2, b: 1 });
+    expect(div.textContent).toBe("a1b0");
+
+    click(div.childNodes[1]);
+    expect(calls).toEqual({ a: 2, b: 2 });
+    expect(div.textContent).toBe("a1b1");
+  });
+});
+
 describe("DOM target", () => {
   it("mounts a host tree", () => {
     const container = mount(
