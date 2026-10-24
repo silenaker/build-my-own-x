@@ -111,6 +111,42 @@ describe("suspense", () => {
     expect(asElement(container.childNodes[0]).tagName).toBe("b");
   });
 
+  it("retries a boundary without re-rendering the rest of the tree", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+    const calls = { app: 0, async: 0, other: 0 };
+
+    function Async() {
+      calls.async++;
+      return createElement("b", { children: use(pending) });
+    }
+    function Other() {
+      calls.other++;
+      return createElement("span", { children: "other" });
+    }
+    function App() {
+      calls.app++;
+      return createElement("div", {
+        children: [
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "wait",
+            children: createElement(Async, {}),
+          }),
+          createElement(Other, {}),
+        ],
+      });
+    }
+
+    const container = mount(createElement(App, {}));
+    expect(container.textContent).toBe("waitother");
+    expect(calls).toEqual({ app: 1, async: 1, other: 1 });
+
+    settle("ready");
+    await until(() => container.textContent === "readyother");
+    // The retry replaced the boundary's range only; ancestors and siblings stayed put.
+    expect(calls).toEqual({ app: 1, async: 2, other: 1 });
+  });
+
   it("keeps a mounted component's state while an update suspends", async () => {
     let pending: Promise<void> | null = null;
     let settle!: () => void;
