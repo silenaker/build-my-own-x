@@ -13,7 +13,7 @@ import {
   useState,
 } from "../react.ts";
 import type { Any } from "../shared.ts";
-import { createRoot } from "../react-dom-client.ts";
+import { createRoot, hydrateRoot } from "../react-dom-client.ts";
 import { asElement, mount, TestDocument, TestText } from "./dom-shim.ts";
 import { until } from "./helpers.ts";
 
@@ -441,5 +441,139 @@ describe("DOM target", () => {
     expect(() => createRoot({ ownerDocument: null } as unknown as Element)).toThrow(
       "createRoot() requires a container that belongs to a document.",
     );
+  });
+});
+
+describe("patching", () => {
+  function mountRoot(element: Any) {
+    const document = new TestDocument();
+    const container = document.createElement("root");
+    const root = createRoot(container as unknown as Element);
+    root.render(element);
+    return { container, root };
+  }
+
+  it("keeps the nodes a re-render did not change", () => {
+    const { container, root } = mountRoot(
+      createElement("div", { className: "a", children: createElement("b", { children: "one" }) }),
+    );
+    const div = asElement(container.childNodes[0]);
+    const bold = asElement(div.childNodes[0]);
+    const text = bold.childNodes[0];
+
+    root.render(
+      createElement("div", { className: "b", children: createElement("b", { children: "two" }) }),
+    );
+
+    expect(container.childNodes[0]).toBe(div);
+    expect(div.childNodes[0]).toBe(bold);
+    expect(bold.childNodes[0]).toBe(text);
+    expect(div.getAttribute("class")).toBe("b");
+    expect((text as TestText).data).toBe("two");
+  });
+
+  it("drops the attributes and children the new element left out", () => {
+    const { container, root } = mountRoot(
+      createElement("div", {
+        id: "x",
+        title: "t",
+        children: [createElement("i", { children: "a" }), createElement("i", { children: "b" })],
+      }),
+    );
+    const div = asElement(container.childNodes[0]);
+    const first = div.childNodes[0];
+
+    root.render(createElement("div", { id: "x", children: createElement("i", { children: "a" }) }));
+
+    expect(div.getAttribute("id")).toBe("x");
+    expect(div.getAttribute("title")).toBeNull();
+    expect(div.childNodes).toHaveLength(1);
+    expect(div.childNodes[0]).toBe(first);
+    expect(container.textContent).toBe("a");
+  });
+
+  it("replaces a changed listener instead of adding another", () => {
+    const calls: string[] = [];
+    const button = (handler: () => void) =>
+      createElement("button", { onClick: handler, children: "go" });
+
+    const { container, root } = mountRoot(button(() => calls.push("old")));
+    const node = asElement(container.childNodes[0]);
+
+    root.render(button(() => calls.push("new")));
+    node.dispatch("click", {});
+
+    expect(node.listeners.get("click")).toHaveLength(1);
+    expect(calls).toEqual(["new"]);
+  });
+
+  it("moves keyed siblings instead of recreating them", () => {
+    const box = (key: string) => createElement("div", { children: key }, key);
+
+    const { container, root } = mountRoot(
+      createElement("section", { children: [box("a"), box("b")] }),
+    );
+    const section = asElement(container.childNodes[0]);
+    const first = section.childNodes[0];
+    const second = section.childNodes[1];
+
+    root.render(createElement("section", { children: [box("b"), box("a")] }));
+
+    expect(section.childNodes[0]).toBe(second);
+    expect(section.childNodes[1]).toBe(first);
+  });
+
+  it("rewrites innerHTML only when it changes", () => {
+    const { container, root } = mountRoot(
+      createElement("div", { dangerouslySetInnerHTML: { __html: "<b>one</b>" } }),
+    );
+    const div = asElement(container.childNodes[0]);
+
+    root.render(createElement("div", { dangerouslySetInnerHTML: { __html: "<b>two</b>" } }));
+
+    expect(container.childNodes[0]).toBe(div);
+    expect(div.innerHTML).toBe("<b>two</b>");
+  });
+
+  it("patches a state update in place", () => {
+    function Counter() {
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "count:" + count,
+      });
+    }
+
+    const { container } = mountRoot(createElement(Counter, {}));
+    const button = asElement(container.childNodes[0]);
+    const text = button.childNodes[0];
+
+    button.dispatch("click", {});
+
+    expect(container.childNodes[0]).toBe(button);
+    expect(button.childNodes[0]).toBe(text);
+    expect((text as TestText).data).toBe("count:1");
+  });
+
+  it("patches the tree a hydration adopted", () => {
+    function Counter() {
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "count:" + count,
+      });
+    }
+
+    const document = new TestDocument();
+    const container = document.createElement("root");
+    const server = document.createElement("button");
+    server.appendChild(document.createTextNode("count:0"));
+    container.appendChild(server);
+    hydrateRoot(container as unknown as Element, createElement(Counter, {}));
+
+    asElement(server).dispatch("click", {});
+
+    expect(container.childNodes[0]).toBe(server);
+    expect(server.textContent).toBe("count:1");
   });
 });

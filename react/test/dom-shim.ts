@@ -94,10 +94,22 @@ export class TestElement extends TestNode {
     const value = this.attributes.get(name);
     return value === undefined ? null : value;
   }
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+  getAttributeNames(): string[] {
+    return [...this.attributes.keys()];
+  }
   addEventListener(type: string, listener: (event: Any) => void): void {
     const list = this.listeners.get(type);
     if (list === undefined) this.listeners.set(type, [listener]);
     else list.push(listener);
+  }
+  removeEventListener(type: string, listener: (event: Any) => void): void {
+    const list = this.listeners.get(type);
+    if (list === undefined) return;
+    const index = list.indexOf(listener);
+    if (index !== -1) list.splice(index, 1);
   }
   /** Test helper: deliver an event to the listeners of `type`. */
   dispatch(type: string, event: Any): void {

@@ -42,6 +42,31 @@ export interface HostConfig<Root, Instance> {
   getCommentText(instance: Instance): string;
   /** Set only on targets whose containers may already hold server markup. */
   hydration?: HydrationConfig<Root, Instance> | null;
+  /** Set only on targets that keep the tree they already rendered. */
+  patch?: PatchConfig<Root, Instance> | null;
+}
+
+/**
+ * A target that patches its tree reuses the host instance a path held in the
+ * previous pass, so a re-render touches only what the new element changed.
+ */
+export interface PatchConfig<Root, Instance> {
+  /** Start a pass; every key the walker reaches has to be retained again. */
+  begin(): void;
+  /** The instance this path held before the pass, or `null` when it held none. */
+  claim(key: string): Instance | null;
+  /** Record `instance` as the occupant of `key` for the next pass. */
+  retain(key: string, instance: Instance): void;
+  /** Bring a claimed host element up to date with its new props. */
+  updateProperties(instance: Instance, properties: NormalizedProperties): void;
+  /** A claimed text node has different content. */
+  updateText(instance: Instance, text: string): void;
+  /** The pass emitted its last child of `parent`; drop whatever is left over. */
+  finishChildren(parent: Root | Instance): void;
+  /** End the pass, forgetting the keys it did not reach. */
+  end(): void;
+  /** Forget every key, so the root renders from scratch again. */
+  reset(): void;
 }
 
 /** One server node a hydrating container still has to match. */
@@ -285,6 +310,8 @@ interface RenderContext<Root, Instance> {
   onError?: (error: Any) => void;
   /** Set only while a pass reuses markup instead of creating nodes. */
   hydrating: boolean;
+  /** Set only when the target keeps its tree, so instances are updated in place. */
+  patch: PatchConfig<Root, Instance> | null;
   hydration: HydrationConfig<Root, Instance> | null;
   /** Thenables found mid-hydration; they are reported only after the pass ends. */
   deferred: DeferredSuspension[] | null;
@@ -320,18 +347,25 @@ function renderPass<Root, Instance>(
   context.scope = { key: "root", index: 0 };
   context.rendered.clear();
   if (context.boundaries !== null) context.boundaries.parent = null;
+  context.patch?.begin();
   try {
-    renderNode(context, element, parent);
-  } catch (thrown) {
-    // No enclosing boundary can show a fallback, so the tree has to be settled
-    // before it is rendered again.
-    if (isThenable(thrown)) {
-      throw new Error(
-        "A component suspended while rendering synchronously, but no <Suspense> boundary " +
-          "was found. Await the tree first (e.g. `await deepAwait(root)`) before rendering it.",
-      );
+    try {
+      renderNode(context, element, parent);
+    } catch (thrown) {
+      // No enclosing boundary can show a fallback, so the tree has to be settled
+      // before it is rendered again.
+      if (isThenable(thrown)) {
+        throw new Error(
+          "A component suspended while rendering synchronously, but no <Suspense> boundary " +
+            "was found. Await the tree first (e.g. `await deepAwait(root)`) before rendering it.",
+        );
+      }
+      throw thrown;
     }
-    throw thrown;
+    // Hydration prunes what it did not claim itself, once the pass settles.
+    if (!context.hydrating) context.patch?.finishChildren(parent);
+  } finally {
+    context.patch?.end();
   }
   // A component missing from this pass was unmounted, so its hooks must not
   // leak into whichever component later occupies the same path.
@@ -402,13 +436,13 @@ function renderNode<Root, Instance>(
 
   switch (typeof node) {
     case "string":
-      renderText(context, parent, node);
+      renderText(context, parent, node, index);
       return;
     case "number":
-      renderText(context, parent, "" + node);
+      renderText(context, parent, "" + node, index);
       return;
     case "bigint":
-      renderText(context, parent, String(node));
+      renderText(context, parent, String(node), index);
       return;
     case "symbol":
       throw new Error("Symbols are not valid as a React child.");
@@ -428,15 +462,36 @@ function renderText<Root, Instance>(
   context: RenderContext<Root, Instance>,
   parent: Root | Instance,
   text: string,
+  index: number,
 ): void {
-  if (!context.hydrating) {
+  // The prefix keeps a text path apart from a host tag that happens to be named `#text`.
+  const key = context.scope.key + "/#text" + index;
+  if (context.hydrating) {
+    const node = claimNode(context, parent, "text");
+    if (node.value !== text) {
+      // A different string means every following node is out of alignment too.
+      throw new HydrationMismatchError();
+    }
+    context.patch?.retain(key, node.instance);
+    return;
+  }
+
+  const patch = context.patch;
+  if (patch === null) {
     context.host.appendChild(parent, context.host.createTextInstance(text));
     return;
   }
-  if (claimNode(context, parent, "text").value !== text) {
-    // A different string means every following node is out of alignment too.
-    throw new HydrationMismatchError();
+
+  const claimed = patch.claim(key);
+  if (claimed !== null) {
+    patch.retain(key, claimed);
+    patch.updateText(claimed, text);
+    context.host.appendChild(parent, claimed);
+    return;
   }
+  const created = context.host.createTextInstance(text);
+  patch.retain(key, created);
+  context.host.appendChild(parent, created);
 }
 
 /** Take the next server node when it has the expected kind, or abandon hydration. */
@@ -511,22 +566,35 @@ function renderHostElement<Root, Instance>(
   parent: Root | Instance,
 ): void {
   const properties = normalizeProperties(props);
+  // The tag is part of the path, so replacing this element remounts its children.
+  const elementKey = context.scope.key + "/" + tag + segment;
+
   let instance: Instance;
+  let claimed = false;
   if (context.hydrating) {
     const node = claimNode(context, parent, "element");
     if (node.value !== tag) throw new HydrationMismatchError();
     instance = node.instance;
+    context.patch?.retain(elementKey, instance);
   } else {
-    instance = context.host.createInstance(tag);
+    const previous = context.patch?.claim(elementKey) ?? null;
+    if (previous !== null) {
+      claimed = true;
+      instance = previous;
+    } else {
+      instance = context.host.createInstance(tag);
+    }
+    context.patch?.retain(elementKey, instance);
   }
 
-  // The tag is part of the path, so replacing this element remounts its children.
-  const elementKey = context.scope.key + "/" + tag + segment;
+  const usesHTML = properties.innerHTML !== null;
   renderInScope(context, elementKey, () => {
-    if (properties.innerHTML !== null) {
+    if (usesHTML) {
       // `dangerouslySetInnerHTML` wins over children.
       // Hydration trusts the server's HTML, so it stays untouched.
-      if (!context.hydrating) context.host.setInnerHTML(instance, properties.innerHTML);
+      if (!context.hydrating && !claimed) {
+        context.host.setInnerHTML(instance, properties.innerHTML as string);
+      }
     } else {
       renderNode(context, props.children, instance);
     }
@@ -537,7 +605,13 @@ function renderHostElement<Root, Instance>(
     context.pendingProps?.push({ instance, properties, key: elementKey });
     return;
   }
-  context.host.setInitialProperties(instance, properties);
+  if (claimed) {
+    context.patch?.updateProperties(instance, properties);
+    // `innerHTML` owns the children, so a pass that rendered none must not prune them.
+    if (!usesHTML) context.patch?.finishChildren(instance);
+  } else {
+    context.host.setInitialProperties(instance, properties);
+  }
   context.host.appendChild(parent, instance);
 }
 
@@ -1166,7 +1240,7 @@ export interface RendererOptions<Root, Instance> {
 
 /** One host-bound walker. Every pass reuses the hook instances it mounted. */
 export interface Renderer<Root> {
-  /** Fill a fresh root with `element`. */
+  /** Render `element` into the root, patching the tree a previous pass left. */
   render(element: Any): Root;
   /** Fill `root`, reusing the markup its host already holds where possible. */
   hydrate(element: Any, root: Root): void;
@@ -1192,6 +1266,7 @@ export function createRenderer<Root, Instance>(
     boundaries: options.boundaries ?? null,
     onError: options.onError,
     hydrating: false,
+    patch: host.patch ?? null,
     hydration: host.hydration ?? null,
     deferred: null,
     pendingProps: null,
@@ -1249,6 +1324,7 @@ export function createRenderer<Root, Instance>(
     reset() {
       context.instances.clear();
       context.rendered.clear();
+      context.patch?.reset();
     },
   };
 }

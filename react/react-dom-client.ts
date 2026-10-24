@@ -2,11 +2,16 @@
  * The DOM host, `createRoot` and `hydrateRoot`.
  */
 
-import { createRenderer, type HostConfig, type HydrationNode } from "./react-dom-core.ts";
+import {
+  createRenderer,
+  type HostConfig,
+  type HydrationNode,
+  type PatchConfig,
+} from "./react-dom-core.ts";
 import type { Any, Thenable } from "./shared.ts";
 
 export interface ReactDomRoot {
-  /** Mount `element`. A later `render` replaces the whole tree. */
+  /** Mount `element`. A later `render` patches the tree the root already holds. */
   render(element: Any): void;
   /** Remove everything this root rendered. */
   unmount(): void;
@@ -31,6 +36,96 @@ function createDomHost(document: Document, container: Element): HostConfig<Eleme
   const originals = new Map<Node, Node[]>();
   const visited = new Map<Node, Set<Node>>();
 
+  /** The node each path holds, so a pass updates it instead of rebuilding it. */
+  const mounted = new Map<string, Node>();
+  /** The keys this pass reached; a key it never reached has been unmounted. */
+  const reached = new Set<string>();
+  /** Index of the next child of each container, so a kept child is not moved. */
+  const placed = new Map<Node, number>();
+  /** The listeners this module attached; an element cannot list them back. */
+  const attached = new WeakMap<Node, Map<string, Any>>();
+  /** The `innerHTML` last written, so an unchanged string is not written again. */
+  const writtenHTML = new WeakMap<Node, string>();
+  let patching = false;
+
+  /** Everything before `index` is settled, so `index` is where the next child goes. */
+  function place(parent: Node, child: Node): void {
+    const index = placed.get(parent) ?? 0;
+    const reference: Node | null = parent.childNodes[index] ?? null;
+    // A child already at the cursor keeps its place; anything else moves here.
+    if (child !== reference) parent.insertBefore(child, reference);
+    placed.set(parent, index + 1);
+  }
+
+  function dropRemaining(parent: Node): void {
+    // Everything from the cursor on is output this pass did not emit.
+    let stale: Node | null = parent.childNodes[placed.get(parent) ?? 0] ?? null;
+    while (stale !== null) {
+      const next: Node | null = stale.nextSibling;
+      parent.removeChild(stale);
+      stale = next;
+    }
+    // The element owns its children now, so a later identical `innerHTML` still applies.
+    writtenHTML.delete(parent);
+    placed.delete(parent);
+  }
+
+  const patch: PatchConfig<Element, Node> = {
+    begin() {
+      patching = true;
+      reached.clear();
+      placed.clear();
+    },
+    end() {
+      patching = false;
+      placed.clear();
+      for (const key of mounted.keys()) {
+        if (!reached.has(key)) mounted.delete(key);
+      }
+      reached.clear();
+    },
+    claim: (key) => mounted.get(key) ?? null,
+    retain(key, node) {
+      reached.add(key);
+      mounted.set(key, node);
+    },
+    updateText(node, text) {
+      if ((node as Text).data !== text) (node as Text).data = text;
+    },
+    updateProperties(node, properties) {
+      const element = node as Element;
+      // An attribute the new props no longer carry is stale.
+      const wanted = new Map(properties.attributes);
+      for (const name of element.getAttributeNames()) {
+        if (!wanted.has(name)) element.removeAttribute(name);
+      }
+      for (const [name, value] of wanted) {
+        if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+      }
+      // A changed listener is swapped, never added beside the old one.
+      const previous = attached.get(node) ?? new Map<string, Any>();
+      const next = new Map<string, Any>(properties.events);
+      for (const [type, listener] of previous) {
+        if (next.get(type) !== listener) element.removeEventListener(type, listener);
+      }
+      for (const [type, listener] of next) {
+        if (previous.get(type) !== listener) element.addEventListener(type, listener);
+      }
+      attached.set(node, next);
+      if (properties.innerHTML !== null && writtenHTML.get(node) !== properties.innerHTML) {
+        element.innerHTML = properties.innerHTML;
+        writtenHTML.set(node, properties.innerHTML);
+      }
+    },
+    finishChildren: (parent) => dropRemaining(parent as Node),
+    reset() {
+      patching = false;
+      mounted.clear();
+      reached.clear();
+      placed.clear();
+    },
+  };
+
   function originalChildren(parent: Node): Node[] {
     let children = originals.get(parent);
     if (children === undefined) {
@@ -54,19 +149,32 @@ function createDomHost(document: Document, container: Element): HostConfig<Eleme
     createInstance: (tag) => document.createElement(tag),
     createTextInstance: (text) => document.createTextNode(text),
     appendChild: (parent, child) => {
-      parent.appendChild(child);
+      // Every append follows the pass cursor, so a kept child is not moved.
+      place(parent as Node, child as Node);
     },
     setInitialProperties: (instance, properties) => {
       // Only elements reach here; text nodes have no properties.
       const element = instance as Element;
       for (const [name, value] of properties.attributes) element.setAttribute(name, value);
-      for (const [type, listener] of properties.events) element.addEventListener(type, listener);
+      const listeners = new Map<string, Any>();
+      for (const [type, listener] of properties.events) {
+        element.addEventListener(type, listener);
+        listeners.set(type, listener);
+      }
+      if (listeners.size > 0) attached.set(instance, listeners);
+      if (properties.innerHTML !== null) writtenHTML.set(instance, properties.innerHTML);
     },
     setInnerHTML: (instance, html) => {
       (instance as Element).innerHTML = html;
+      writtenHTML.set(instance, html);
     },
     createStagingRoot: () => document.createDocumentFragment(),
     commitStaged: (parent, staged, reference) => {
+      if (patching && reference === undefined) {
+        // Staged children take the parent's cursor, so they keep their order.
+        for (const child of [...(staged as Node).childNodes]) place(parent as Node, child);
+        return;
+      }
       // `insertBefore` with a null reference appends, as the staging path expects.
       (parent as Node).insertBefore(staged as Node, (reference as Node | null) ?? null);
     },
@@ -84,6 +192,7 @@ function createDomHost(document: Document, container: Element): HostConfig<Eleme
       (instance as Comment).data = text;
     },
     getCommentText: (instance) => (instance as Comment).data,
+    patch,
     hydration: {
       begin() {
         cursors.clear();
@@ -166,7 +275,7 @@ export function createRoot(container: Element): ReactDomRoot {
 
 /**
  * Adopt markup the server already rendered into `container`. Later renders
- * replace the tree as `createRoot` does, keeping the hook state they already hold.
+ * patch that markup as `createRoot` does, keeping the hook state they already hold.
  */
 export function hydrateRoot(container: Element, element: Any): ReactDomRoot {
   const controls = createRootControls(container);
@@ -223,7 +332,7 @@ function createRootControls(container: Element): RootControls {
     try {
       do {
         needsRerender = false;
-        clearChildren(container);
+        // The renderer patches the tree in place; unmounting is what clears it.
         renderer.render(rootElement);
       } while (needsRerender);
     } finally {
