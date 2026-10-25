@@ -363,8 +363,12 @@ interface RenderContext<Root, Instance> {
   deferred: DeferredSuspension[] | null;
   /** Host properties claimed by a hydrating pass, applied only if it commits. */
   pendingProps: PendingProperties<Instance>[] | null;
-  /** Full passes so far, so a retry armed by an old tree cannot touch a newer one. */
+  /** Full passes so far, so a boundary missing from one can be told apart. */
   pass: number;
+  /** Boundary scopes this pass armed a retry for, mirroring `rendered` above. */
+  armed: Set<string>;
+  /** The wait each boundary is holding; a re-render of it replaces only its retry. */
+  waits: Map<string, BoundaryWait>;
   /** Apply one component's queued state, either in place or as part of a root pass. */
   schedule: (instance: ComponentInstance) => void;
   /** Nesting depth of staging roots; output rendered there has no stable location yet. */
@@ -382,6 +386,18 @@ interface DeferredSuspension {
   retry: () => void;
   /** The content scope that armed the retry, so a later replacement can drop it. */
   key: string;
+}
+
+/** One boundary's wait on a thenable, kept while the boundary stays on screen. */
+interface BoundaryWait {
+  /** Scope of the boundary, so a wait a pass dropped can tell that it is gone. */
+  key: string;
+  /** The thenable this wait was armed for; waiting on another one starts a new wait. */
+  thenable: Thenable;
+  /** The retry the boundary wants now; a re-render replaces this field, not the wait. */
+  retry: () => void;
+  /** Handed to the host for `thenable`, so arming the same wait twice registers once. */
+  settle: () => void;
 }
 
 interface PendingProperties<Instance> {
@@ -402,6 +418,7 @@ function renderPass<Root, Instance>(
   context.pass++;
   context.scope = { key: "root", index: 0, depth: 0 };
   context.rendered.clear();
+  context.armed.clear();
   if (context.boundaries !== null) context.boundaries.parent = null;
   context.patch?.begin();
   try {
@@ -423,14 +440,31 @@ function renderPass<Root, Instance>(
   } finally {
     context.patch?.end();
   }
-  // A component missing from this pass was unmounted, so its hooks must not
-  // leak into whichever component later occupies the same path.
-  for (const key of context.instances.keys()) {
-    if (!context.rendered.has(key)) context.instances.delete(key);
+  // A root pass owns every key, so anything it never reached is gone.
+  prunePass(context);
+}
+
+/**
+ * Drop what a pass did not reach. Instances, boundary records and waits are all
+ * keyed by path, so a pass owns the keys under `prefix` (or every key when it
+ * rendered the whole tree) and forgets the rest; that is how each of them learns
+ * it is gone.
+ */
+function prunePass<Root, Instance>(context: RenderContext<Root, Instance>, prefix?: string): void {
+  const owns = (key: string): boolean => prefix === undefined || key.startsWith(prefix);
+
+  // A component the pass missed was unmounted, so its hooks must not leak into
+  // whichever component later occupies the same path.
+  for (const key of [...context.instances.keys()]) {
+    if (owns(key) && !context.rendered.has(key)) context.instances.delete(key);
   }
-  // A boundary the pass never reached is gone, so its retry must not fire later.
-  for (const [key, record] of context.clientBoundaries) {
-    if (record.pass !== context.pass) context.clientBoundaries.delete(key);
+  // A boundary the pass missed is gone, so its retry must not fire later.
+  for (const [key, record] of [...context.clientBoundaries]) {
+    if (owns(key) && record.pass !== context.pass) context.clientBoundaries.delete(key);
+  }
+  // A boundary that armed nothing has stopped waiting.
+  for (const key of [...context.waits.keys()]) {
+    if (owns(key) && !context.armed.has(key)) context.waits.delete(key);
   }
 }
 
@@ -779,6 +813,7 @@ function renderComponentUpdate<Root, Instance>(
   context.pass++;
   context.rendered.clear();
   context.rendered.add(instance.key);
+  context.armed.clear();
   context.scope = { key: instance.outputKey, index: 0, depth: instance.depth + 1 };
   patch.begin();
   patch.positionAt(parent, start);
@@ -807,18 +842,9 @@ function renderComponentUpdate<Root, Instance>(
     patch.end(instance.outputKey + "/");
   }
 
-  // Components the pass did not reach went away with the replaced output.
-  const prefix = instance.outputKey + "/";
-  for (const key of [...context.instances.keys()]) {
-    if (key.startsWith(prefix) && !context.rendered.has(key)) context.instances.delete(key);
-  }
-  // Boundaries in the same subtree were replaced with it, so their records are void.
-  for (const key of [...context.clientBoundaries.keys()]) {
-    const record = context.clientBoundaries.get(key);
-    if (key.startsWith(prefix) && record !== undefined && record.pass !== context.pass) {
-      context.clientBoundaries.delete(key);
-    }
-  }
+  // Components the pass did not reach went away with the replaced output; so did
+  // the boundaries it never re-rendered. The pass only owns its own subtree.
+  prunePass(context, instance.outputKey + "/");
   return "rendered";
 }
 
@@ -912,18 +938,20 @@ function renderSuspenseContent<Root, Instance>(
   } catch (thrown) {
     if (!isThenable(thrown)) throw thrown;
     retainScope(context, contentKey);
+    // The attempt is thrown away, so boundaries it armed go with it.
+    dropStagedWaits(context, contentKey);
     renderBoundaryFallback(context, props.fallback, fallbackKey, parent);
     if (start >= 0 && record !== null && patch !== null) {
       record.output = patch.nodesBetween(parent, start);
       record.pending = true;
-      suspend(context, thrown, record.retry, contentKey);
+      suspendContent(context, contentKey, thrown, record.retry);
     } else {
       // Only a real parent can be retried in place; a staged render reuses the root.
       if (record !== null) {
         record.output = null;
         record.pending = false;
       }
-      suspend(context, thrown, context.rerender, contentKey);
+      suspendContent(context, contentKey, thrown, context.rerender);
     }
     return;
   }
@@ -996,6 +1024,7 @@ function retryClientBoundary<Root, Instance>(
 
   context.pass++;
   context.rendered.clear();
+  context.armed.clear();
   context.rendering = true;
   patch.begin();
   patch.positionAt(parent, start);
@@ -1008,7 +1037,8 @@ function retryClientBoundary<Root, Instance>(
       // The fallback is still on screen, so only the wait has to be renewed.
       retainScope(context, record.contentKey);
       record.pass = context.pass;
-      suspend(context, thrown, record.retry, record.contentKey);
+      dropStagedWaits(context, record.contentKey);
+      suspendContent(context, record.contentKey, thrown, record.retry);
       return;
     }
 
@@ -1020,11 +1050,8 @@ function retryClientBoundary<Root, Instance>(
   } finally {
     context.rendering = false;
     patch.end(record.key + ":");
-    // Content components the retry did not reach went away with the old output.
-    const prefix = record.key + ":";
-    for (const key of [...context.instances.keys()]) {
-      if (key.startsWith(prefix) && !context.rendered.has(key)) context.instances.delete(key);
-    }
+    // The retry replaced one boundary's range, so it only owns that range.
+    prunePass(context, record.key + ":");
     context.afterPass();
   }
 }
@@ -1135,16 +1162,62 @@ function suspendBoundary<Root, Instance>(
   retry: () => void,
 ): void {
   retainScope(context, contentKey);
-  const pass = context.pass;
-  suspend(
-    context,
-    thenable,
-    () => {
-      /** A retry only runs while the tree that armed it is still the current one. */
-      if (context.pass === pass) retry();
-    },
-    contentKey,
-  );
+  suspendContent(context, contentKey, thenable, retry);
+}
+
+/**
+ * Wait on `thenable` for the boundary at `contentKey` and name the retry that
+ * settles it. The boundary keeps one wait while it stays on screen and keeps
+ * waiting on the same thenable: a re-render only replaces the retry it holds, so
+ * the host's registration stays a single one and always runs the newest props.
+ * Waiting on another thenable starts a new wait, which leaves the wake-up the
+ * previous one registered with nothing to settle.
+ */
+function suspendContent<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  contentKey: string,
+  thenable: Thenable,
+  retry: () => void,
+): void {
+  context.armed.add(contentKey);
+  let wait = context.waits.get(contentKey);
+  if (wait === undefined || wait.thenable !== thenable) {
+    const created: BoundaryWait = {
+      key: contentKey,
+      thenable,
+      retry,
+      settle: () => settleBoundary(context, created),
+    };
+    wait = created;
+    context.waits.set(contentKey, created);
+  }
+  wait.retry = retry;
+  suspend(context, thenable, wait.settle, contentKey);
+}
+
+/** Run the boundary's newest retry; a wait the pass dropped or replaced runs nothing. */
+function settleBoundary<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  wait: BoundaryWait,
+): void {
+  if (context.waits.get(wait.key) !== wait) return;
+  context.waits.delete(wait.key);
+  wait.retry();
+}
+
+/**
+ * Forget the waits a staged attempt armed inside `key`: its output never reached
+ * the screen, so a boundary in it has nothing to wake. The boundary's own wait is
+ * keyed exactly `key`, so only what the attempt nested is dropped.
+ */
+function dropStagedWaits<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  key: string,
+): void {
+  const prefix = key + "/";
+  for (const armed of [...context.waits.keys()]) {
+    if (armed.startsWith(prefix)) context.waits.delete(armed);
+  }
 }
 
 /** Forget retries armed by a subtree that is about to be replaced wholesale. */
@@ -1370,6 +1443,8 @@ function probeBoundaryContent<Root, Instance>(
     const staged = renderBoundaryChildren(context, children, contentKey, 0);
     return { status: "ready", staged };
   } catch (thrown) {
+    // Whatever the attempt armed inside its content is discarded with it.
+    dropStagedWaits(context, contentKey);
     if (isThenable(thrown)) return { status: "suspended", thenable: thrown };
     return { status: "threw", error: thrown };
   } finally {
@@ -1406,6 +1481,7 @@ function attemptBoundaryHydration<Root, Instance>(
       return { status: "hydrated", queued };
     } catch (thrown) {
       // A wakeable only means the data is late; anything else is a mismatch.
+      dropStagedWaits(context, contentKey);
       if (isThenable(thrown)) return { status: "suspended", thenable: thrown };
       return { status: "mismatched" };
     }
@@ -1582,6 +1658,8 @@ export function createRenderer<Root, Instance>(
     deferred: null,
     pendingProps: null,
     pass: 0,
+    armed: new Set(),
+    waits: new Map(),
     schedule,
     staging: 0,
     clientBoundaries: new Map(),
@@ -1712,6 +1790,8 @@ export function createRenderer<Root, Instance>(
       context.instances.clear();
       context.rendered.clear();
       context.clientBoundaries.clear();
+      context.armed.clear();
+      context.waits.clear();
       context.patch?.reset();
     },
   };

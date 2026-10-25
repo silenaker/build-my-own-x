@@ -292,6 +292,69 @@ describe("hydrating Suspense", () => {
     expect((div.childNodes[3] as TestComment).data).toBe("/$");
   });
 
+  it("keeps a pending boundary when an unrelated state update runs first", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+
+    function Show() {
+      return createElement("b", { children: use(pending) });
+    }
+    function Shell() {
+      const [count, setCount] = useState(0);
+      return createElement("div", {
+        children: [
+          createElement("button", {
+            onClick: () => setCount(count + 1),
+            children: "count:" + count,
+          }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: createElement("p", { children: "loading" }),
+            children: createElement(Show, {}),
+          }),
+        ],
+      });
+    }
+
+    const { container } = hydrateMarkup(
+      '<div><button>count:0</button><!--$?--><template id="B0"></template><p>loading</p><!--/$--></div>',
+      createElement(Shell, {}),
+    );
+    const div = asElement(container.childNodes[0]);
+
+    // The update runs while the boundary is still waiting on its data.
+    asElement(div.childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("count:1loading");
+
+    // The boundary was still pending, so its settlement must still be honoured.
+    settle("done");
+    await until(() => container.textContent === "count:1done");
+  });
+
+  it("retries every boundary that waits on the same thenable", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+
+    function Show({ label }: { label: string }) {
+      return createElement("b", { children: label + use(pending) });
+    }
+    const boundary = (label: string) =>
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: createElement("p", { children: "loading" }),
+        children: createElement(Show, { label }),
+      });
+
+    const { container } = hydrateMarkup(
+      '<div><!--$?--><template id="B0"></template><p>loading</p><!--/$-->' +
+        '<!--$?--><template id="B1"></template><p>loading</p><!--/$--></div>',
+      createElement("div", { children: [boundary("a:"), boundary("b:")] }),
+    );
+    expect(container.textContent).toBe("loadingloading");
+
+    // One settlement has to release both boundaries: each keeps its own retry.
+    settle("1");
+    await until(() => container.textContent === "a:1b:1");
+  });
+
   it("defers a retry that settles while the walk is still hydrating", () => {
     // A synchronous thenable is the worst case: without deferral the retry
     // would replace the boundary while the pass is still claiming its nodes.

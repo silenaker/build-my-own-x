@@ -314,8 +314,8 @@ function createRootControls(container: Element): RootControls {
     throw new Error("createRoot() requires a container that belongs to a document.");
   }
 
-  /** Thenables a boundary is waiting on, so a settlement retries the root once. */
-  const waiting = new Set<Thenable>();
+  /** The retries waiting on each thenable, so one settlement can release several. */
+  const waiting = new Map<Thenable, Set<() => void>>();
 
   let rootElement: Any = null;
   let mounted = false;
@@ -328,11 +328,23 @@ function createRootControls(container: Element): RootControls {
   });
 
   function retryWhenSettled(thenable: Thenable, retry: () => void): void {
-    if (waiting.has(thenable)) return;
-    waiting.add(thenable);
+    let retries = waiting.get(thenable);
+    const first = retries === undefined;
+    if (retries === undefined) {
+      retries = new Set();
+      waiting.set(thenable, retries);
+    }
+    // Registered before subscribing, so a thenable that settles synchronously
+    // still finds the retry it has to run.
+    retries.add(retry);
+    if (!first) return;
+
     const rerun = (): void => {
+      const pending = waiting.get(thenable);
       waiting.delete(thenable);
-      if (mounted) retry();
+      if (!mounted || pending === undefined) return;
+      // Several boundaries can wait on one promise; each runs its newest retry.
+      for (const run of pending) run();
     };
     // A rejection retries too: `use()` throws the reason on the next pass.
     thenable.then(rerun, rerun);

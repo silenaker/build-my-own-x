@@ -15,7 +15,7 @@ import {
 import type { Any } from "../shared.ts";
 import { createRoot, hydrateRoot } from "../react-dom-client.ts";
 import { asElement, mount, TestDocument, TestText } from "./dom-shim.ts";
-import { until } from "./helpers.ts";
+import { delay, until } from "./helpers.ts";
 
 describe("suspense", () => {
   const never = new Promise<never>(() => {});
@@ -91,6 +91,306 @@ describe("suspense", () => {
 
     settleB("2");
     await until(() => container.textContent === "a:1b:2");
+  });
+
+  it("retries every boundary that waits on the same thenable", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+
+    function Show({ label }: { label: string }) {
+      return createElement("b", { children: label + use(pending) });
+    }
+    const boundary = (label: string) =>
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: label + "waiting",
+        children: createElement(Show, { label }),
+      });
+
+    const container = mount(createElement("div", { children: [boundary("a:"), boundary("b:")] }));
+    expect(container.textContent).toBe("a:waitingb:waiting");
+
+    // One settlement has to release both boundaries: each keeps its own retry.
+    settle("1");
+    await until(() => container.textContent === "a:1b:1");
+  });
+
+  it("drops a pending retry when a re-render removes the boundary", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+    let renders = 0;
+
+    function Show() {
+      return createElement("b", { children: "show:" + use(pending) });
+    }
+    function Replacement() {
+      renders++;
+      return createElement("p", { children: "gone" });
+    }
+
+    const document = new TestDocument();
+    const container = document.createElement("root");
+    const root = createRoot(container as unknown as Element);
+    root.render(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: createElement("p", { children: "loading" }),
+        children: createElement(Show, {}),
+      }),
+    );
+    expect(container.textContent).toBe("loading");
+
+    // The root pass no longer renders the boundary, so its wait dies with it.
+    root.render(createElement(Replacement, {}));
+    expect(container.textContent).toBe("gone");
+    expect(renders).toBe(1);
+
+    // The data arrives for a boundary that is no longer on screen: no rebuild.
+    settle("late");
+    await delay(10);
+    expect(renders).toBe(1);
+    expect(container.textContent).toBe("gone");
+  });
+
+  it("drops a pending retry when a targeted update removes the boundary", async () => {
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+    let renders = 0;
+
+    function Show() {
+      return createElement("b", { children: "show:" + use(pending) });
+    }
+    function Shell() {
+      renders++;
+      const [hidden, setHidden] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", { onClick: () => setHidden(true), children: "hide" }),
+          hidden
+            ? null
+            : createElement(REACT_SUSPENSE_TYPE, {
+                fallback: "loading",
+                children: createElement(Show, {}),
+              }),
+        ],
+      });
+    }
+
+    const container = mount(createElement(Shell, {}));
+    expect(container.textContent).toBe("hideloading");
+    expect(renders).toBe(1);
+
+    // A scoped pass owns only its own subtree: the wait inside it goes away.
+    asElement(asElement(container.childNodes[0]).childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("hide");
+    expect(renders).toBe(2);
+
+    settle("late");
+    await delay(10);
+    expect(renders).toBe(2);
+    expect(container.textContent).toBe("hide");
+  });
+
+  it("drops the waits a discarded attempt armed inside its content", async () => {
+    let settleNested!: (value: string) => void;
+    const nested = new Promise<string>((resolve) => (settleNested = resolve));
+    const stillWaiting = new Promise<void>(() => {});
+    let renders = 0;
+
+    function Nested() {
+      return createElement("b", { children: "nested:" + use(nested) });
+    }
+    function Outer({ armed }: { armed: boolean }) {
+      if (armed) use(stillWaiting);
+      return null;
+    }
+    function Shell() {
+      renders++;
+      const [armed, setArmed] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", { onClick: () => setArmed(true), children: "arm" }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "outer-wait",
+            children: [
+              createElement(REACT_SUSPENSE_TYPE, {
+                fallback: "nested-wait",
+                children: createElement(Nested, {}),
+              }),
+              createElement(Outer, { armed }),
+            ],
+          }),
+        ],
+      });
+    }
+
+    const container = mount(createElement(Shell, {}));
+    // The nested boundary shows its own fallback inside the committed content.
+    expect(container.textContent).toBe("armnested-wait");
+
+    // Arming makes the outer content suspend, so that whole attempt is dropped
+    // and the nested boundary armed inside it never reached the screen.
+    asElement(asElement(container.childNodes[0]).childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("armouter-wait");
+    const before = renders;
+
+    settleNested("done");
+    await delay(10);
+    expect(renders).toBe(before);
+    expect(container.textContent).toBe("armouter-wait");
+  });
+
+  it("runs one retry per settlement when a pending boundary re-renders", async () => {
+    let settle!: (value: string) => void;
+    const data = new Promise<string>((resolve) => (settle = resolve));
+    /** Never resolves, so every retry suspends again and stays countable. */
+    const stillWaiting = new Promise<string>(() => {});
+    let attempts = 0;
+
+    function Show({ count }: { count: number }) {
+      attempts++;
+      const value = use(data);
+      use(stillWaiting);
+      return createElement("b", { children: value + count });
+    }
+    function Shell() {
+      const [count, setCount] = useState(0);
+      return createElement("div", {
+        children: [
+          createElement("button", { onClick: () => setCount(count + 1), children: "n:" + count }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "loading",
+            children: createElement(Show, { count }),
+          }),
+        ],
+      });
+    }
+
+    const container = mount(createElement(Shell, {}));
+    const div = asElement(container.childNodes[0]);
+    const button = asElement(div.childNodes[0]);
+    expect(container.textContent).toBe("n:0loading");
+
+    // The ancestor's update re-renders the boundary, which suspends again: it
+    // keeps its single wait and only names a newer retry.
+    button.dispatch("click", {});
+    expect(container.textContent).toBe("n:1loading");
+    const before = attempts;
+
+    settle("done");
+    await until(() => attempts > before);
+    await delay(10);
+
+    // One settlement runs one retry, however often the boundary rendered before.
+    expect(attempts).toBe(before + 1);
+    expect(asElement(div.childNodes[0])).toBe(button);
+    expect(container.textContent).toBe("n:1loading");
+  });
+
+  it("ignores a settlement for a boundary that was replaced", async () => {
+    let settleFirst!: (value: string) => void;
+    let settleSecond!: (value: string) => void;
+    const first = new Promise<string>((resolve) => (settleFirst = resolve));
+    const second = new Promise<string>((resolve) => (settleSecond = resolve));
+    let renders = 0;
+
+    function Show({ value }: { value: Promise<string> }) {
+      return createElement("b", { children: "content:" + use(value) });
+    }
+    function Shell() {
+      renders++;
+      const [shown, setShown] = useState(true);
+      const [useSecond, setUseSecond] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", {
+            onClick: () => {
+              setShown(!shown);
+              if (shown) setUseSecond(true);
+            },
+            children: "toggle",
+          }),
+          shown
+            ? createElement(REACT_SUSPENSE_TYPE, {
+                fallback: "loading",
+                children: createElement(Show, { value: useSecond ? second : first }),
+              })
+            : null,
+        ],
+      });
+    }
+
+    const container = mount(createElement(Shell, {}));
+    const div = asElement(container.childNodes[0]);
+    const button = asElement(div.childNodes[0]);
+    expect(container.textContent).toBe("toggleloading");
+
+    // Drop the boundary and bring it back on another thenable at the same path.
+    button.dispatch("click", {});
+    expect(container.textContent).toBe("toggle");
+    button.dispatch("click", {});
+    expect(container.textContent).toBe("toggleloading");
+    const before = renders;
+
+    // The first thenable belongs to a wait that is no longer the boundary's.
+    settleFirst("a");
+    await delay(10);
+    expect(renders).toBe(before);
+    expect(container.textContent).toBe("toggleloading");
+
+    // The boundary's own thenable still settles it.
+    settleSecond("b");
+    await until(() => container.textContent === "togglecontent:b");
+  });
+
+  it("ignores a settlement for a thenable the boundary moved off", async () => {
+    let settleFirst!: (value: string) => void;
+    let settleSecond!: (value: string) => void;
+    const first = new Promise<string>((resolve) => (settleFirst = resolve));
+    const second = new Promise<string>((resolve) => (settleSecond = resolve));
+    /** Never resolves, so every attempt suspends again and stays countable. */
+    const stillWaiting = new Promise<string>(() => {});
+    let attempts = 0;
+
+    function Show({ value }: { value: Promise<string> }) {
+      attempts++;
+      const text = use(value);
+      use(stillWaiting);
+      return createElement("b", { children: "content:" + text });
+    }
+    function Shell() {
+      const [swapped, setSwapped] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", { onClick: () => setSwapped(true), children: "swap" }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "wait",
+            children: createElement(Show, { value: swapped ? second : first }),
+          }),
+        ],
+      });
+    }
+
+    const container = mount(createElement(Shell, {}));
+    const div = asElement(container.childNodes[0]);
+    expect(container.textContent).toBe("swapwait");
+
+    // The same boundary, at the same path, now waits on the second thenable.
+    // The old registration for the first one is still around.
+    asElement(div.childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("swapwait");
+    expect(attempts).toBe(2);
+
+    // The thenable the boundary no longer waits on must not wake it, even though
+    // the wait was armed for it first.
+    settleFirst("a");
+    await delay(10);
+    expect(attempts).toBe(2);
+
+    // The thenable it does wait on runs exactly one attempt.
+    settleSecond("b");
+    await until(() => attempts === 3);
+    await delay(10);
+    expect(attempts).toBe(3);
+    expect(container.textContent).toBe("swapwait");
   });
 
   it("waits for a lazy component and renders it once loaded", async () => {
