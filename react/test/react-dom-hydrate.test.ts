@@ -3,7 +3,14 @@
  * when the client tree cannot be lined up with it.
  */
 import { describe, expect, it } from "vitest";
-import { REACT_SUSPENSE_TYPE, createElement, use, useState } from "../react.ts";
+import {
+  REACT_SUSPENSE_TYPE,
+  createElement,
+  use,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "../react.ts";
 import type { Any } from "../shared.ts";
 import { hydrateRoot } from "../react-dom-client.ts";
 import { REVEAL_BOUNDARY } from "../react-dom-server.ts";
@@ -133,6 +140,26 @@ describe("hydration", () => {
     const { container } = hydrateMarkup("<button>count:0</button>", createElement(Counter, {}));
     asElement(container.childNodes[0]).dispatch("click", {});
     expect(container.textContent).toBe("count:1");
+  });
+
+  it("runs the effects of the tree it adopted", async () => {
+    const log: string[] = [];
+    function Comp() {
+      useLayoutEffect(() => {
+        log.push("layout");
+      }, []);
+      useEffect(() => {
+        log.push("passive");
+      }, []);
+      return createElement("div", { children: "server" });
+    }
+
+    const { container } = hydrateMarkup("<div>server</div>", createElement(Comp, {}));
+    expect(container.textContent).toBe("server");
+    expect(log).toEqual(["layout"]);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(log).toEqual(["layout", "passive"]);
   });
 
   it("matches a component's output inside its host wrapper", () => {

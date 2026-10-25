@@ -144,6 +144,32 @@ interface HookSlot {
   /** `useMemo` / `useCallback`: the memoized value and the deps it was based on. */
   memoized?: Any;
   deps?: unknown[];
+  /** `useEffect` / `useLayoutEffect`: what the last commit ran and what it owes. */
+  effect?: EffectHook;
+}
+
+/**
+ * One effect hook's committed state. The latest render's callback and deps live
+ * in the pass that read them, so a render that never commits leaves this alone.
+ */
+interface EffectHook {
+  /** Cleanup returned by the last run, owed before the next one or on unmount. */
+  destroy: (() => void) | undefined;
+  /** Deps of the last run, so an unchanged list leaves the effect alone. */
+  committedDeps: unknown[] | undefined;
+  /** False until the first run; without it an effect with no deps looks settled. */
+  ran: boolean;
+  /** `useLayoutEffect` commits with the tree; `useEffect` waits for the paint. */
+  layout: boolean;
+}
+
+/** One effect a commit owes, captured as the render that read it wrote it. */
+interface PendingEffect {
+  /** The component the hook belongs to, so a later unmount can cancel the run. */
+  instance: ComponentInstance;
+  hook: EffectHook;
+  create: () => void | (() => void);
+  deps: unknown[] | undefined;
 }
 
 /**
@@ -161,6 +187,8 @@ interface ComponentInstance {
   hooks: HookSlot[];
   /** Ordinal of the next hook call. */
   hookIndex: number;
+  /** Effects read by the invocation in progress, in the order they were declared. */
+  pending: PendingEffect[];
   /** Apply this component's queued state, without re-rendering the root. */
   rerender: () => void;
   /** The component the hooks belong to; another one at the same slot mounts fresh. */
@@ -289,6 +317,26 @@ function readMemo<T>(factory: () => T, deps: unknown[] | undefined): T {
   return hook.memoized as T;
 }
 
+/**
+ * Record an effect for the commit that may follow. Nothing runs here: whether
+ * the callback is owed depends on the deps and on the render reaching the screen.
+ */
+function readEffect(
+  create: () => void | (() => void),
+  deps: unknown[] | undefined,
+  layout: boolean,
+): void {
+  const instance = requireInstance();
+  const hook = nextHook();
+  if (hook.effect === undefined) {
+    hook.effect = { destroy: undefined, committedDeps: undefined, ran: false, layout };
+  }
+  hook.effect.layout = layout;
+  // The pass keeps the callback and deps it read, so a later render cannot
+  // rewrite an effect that is still waiting to run.
+  instance.pending.push({ instance, hook: hook.effect, create, deps });
+}
+
 /** Shallow compare by `Object.is`. */
 function areDepsEqual(previous: unknown[] | undefined, next: unknown[] | undefined): boolean {
   if (previous === undefined || next === undefined) return false;
@@ -304,6 +352,8 @@ const hookDispatcher: Dispatcher = {
   useReducer: readReducer,
   useRef: readRef,
   useMemo: readMemo,
+  useEffect: (create, deps) => readEffect(create, deps, false),
+  useLayoutEffect: (create, deps) => readEffect(create, deps, true),
 };
 
 const noop = (): void => {};
@@ -394,6 +444,12 @@ interface RenderContext<Root, Instance> {
   rendering: boolean;
   /** Let the scheduler settle queued state after a scoped retry, like it does after a pass. */
   afterPass: () => void;
+  /** Effects the committed work recorded, or `null` on a target that never runs them. */
+  effects: PendingEffect[] | null;
+  /** Cleanups owned by components that left the tree during a pass. */
+  cleanups: EffectHook[];
+  /** Run what the commit recorded: layout effects now, passive effects after the paint. */
+  flushEffects: () => void;
 }
 
 interface DeferredSuspension {
@@ -481,7 +537,14 @@ function prunePass<Root, Instance>(context: RenderContext<Root, Instance>, prefi
   // A component the pass missed was unmounted, so its hooks must not leak into
   // whichever component later occupies the same path.
   for (const key of [...context.instances.keys()]) {
-    if (owns(key) && !context.rendered.has(key)) context.instances.delete(key);
+    if (!owns(key) || context.rendered.has(key)) continue;
+    const instance = context.instances.get(key) as ComponentInstance;
+    context.instances.delete(key);
+    // What the component ran it now owes a cleanup, in the phase that ran it.
+    for (const hook of instance.hooks) {
+      const effect = hook.effect;
+      if (effect !== undefined && effect.ran) context.cleanups.push(effect);
+    }
   }
   // A boundary the pass missed is gone, so its retry must not fire later.
   for (const [key, record] of [...context.clientBoundaries]) {
@@ -526,6 +589,7 @@ function getInstance<Root, Instance>(
       id: nextInstanceId++,
       hooks: [],
       hookIndex: 0,
+      pending: [],
       key,
       props: null,
       depth: 0,
@@ -770,6 +834,7 @@ function renderComponent<Root, Instance>(
       renderNode(context, output, parent);
     });
     recordOutput(context, instance, parent, patch.nodesBetween(parent, start));
+    commitInstanceEffects(context, instance);
     return;
   }
 
@@ -779,6 +844,20 @@ function renderComponent<Root, Instance>(
   renderInScope(context, outputKey, () => {
     renderNode(context, output, parent);
   });
+  commitInstanceEffects(context, instance);
+}
+
+/**
+ * Hand a component's effects to the pass once its subtree has rendered, so the
+ * order is children first and a subtree that threw never commits at all.
+ */
+function commitInstanceEffects<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  instance: ComponentInstance,
+): void {
+  const effects = context.effects;
+  if (effects === null) return;
+  for (const pending of instance.pending) effects.push(pending);
 }
 
 /**
@@ -812,6 +891,8 @@ function invokeComponent(instance: ComponentInstance, component: Any, props: Any
 
   currentInstance = instance;
   instance.hookIndex = 0;
+  // A previous invocation's effects never reached a commit; this one owns the list.
+  instance.pending.length = 0;
   ReactSharedInternals.currentDispatcher = hookDispatcher;
 
   let output: Any;
@@ -865,6 +946,7 @@ function renderComponentUpdate<Root, Instance>(
   context.rendered.add(instance.key);
   context.armed.clear();
   context.scope = { key: instance.outputKey, index: 0, depth: instance.depth + 1 };
+  const effectMark = context.effects === null ? 0 : context.effects.length;
   patch.begin();
   patch.positionAt(parent, start);
   try {
@@ -872,6 +954,8 @@ function renderComponentUpdate<Root, Instance>(
       const output = invokeComponent(instance, instance.type, instance.props);
       renderNode(context, output, parent);
     } catch (thrown) {
+      // The attempt is thrown away, so the effects its subtree read are not owed.
+      if (context.effects !== null) context.effects.length = effectMark;
       // The boundary that could catch this is above the scope this pass started
       // in, so only a root pass can put it back on the stack.
       if (isThenable(thrown)) return "suspended";
@@ -884,6 +968,7 @@ function renderComponentUpdate<Root, Instance>(
       if (!next.includes(node)) patch.remove(parent, node as Instance);
     }
     instance.output = next;
+    commitInstanceEffects(context, instance);
   } finally {
     patch.end(instance.outputKey + "/");
   }
@@ -891,6 +976,8 @@ function renderComponentUpdate<Root, Instance>(
   // Components the pass did not reach went away with the replaced output; so did
   // the boundaries it never re-rendered. The pass only owns its own subtree.
   prunePass(context, instance.outputKey + "/");
+  // The update reached the document, so the effects it recorded are owed now.
+  context.flushEffects();
   return "rendered";
 }
 
@@ -1102,6 +1189,8 @@ function retryClientBoundary<Root, Instance>(
     patch.end(record.key + ":");
     // The retry replaced one boundary's range, so it only owns that range.
     prunePass(context, record.key + ":");
+    // A retry is its own commit: nothing above it will flush what it ran.
+    context.flushEffects();
     context.afterPass();
   }
 }
@@ -1134,6 +1223,8 @@ function renderIntoStagingRoot<Root, Instance>(
 ): Root | Instance {
   const staged = context.host.createStagingRoot();
   context.stagedRanges.set(staged, []);
+  const effects = context.effects;
+  const mark = effects === null ? 0 : effects.length;
   try {
     renderInScope(context, key, () => {
       renderNode(context, children, staged);
@@ -1141,6 +1232,8 @@ function renderIntoStagingRoot<Root, Instance>(
   } catch (thrown) {
     // The attempt never reaches the document, so nothing it recorded can settle.
     context.stagedRanges.delete(staged);
+    // Its effects are owed by a tree that was never committed, so they go too.
+    if (effects !== null) effects.length = mark;
     throw thrown;
   }
   return staged;
@@ -1401,6 +1494,7 @@ function hydrateCompletedBoundary<Root, Instance>(
   parent: Root | Instance,
 ): void {
   const start = acceptMarker(context, parent, "$");
+  const effectMark = context.effects === null ? 0 : context.effects.length;
   try {
     renderInScope(context, contentKey, () => {
       renderNode(context, props.children, parent);
@@ -1408,6 +1502,8 @@ function hydrateCompletedBoundary<Root, Instance>(
     acceptMarker(context, parent, "/$");
   } catch (thrown) {
     dropPendingProps(context, contentKey);
+    // The attempt never stood, so the effects its content read are not owed.
+    if (context.effects !== null) context.effects.length = effectMark;
     skipUntilEndMarker(context, parent);
     const end = acceptMarker(context, parent, "/$");
     // A suspension is not a mismatch: the server's content is the right
@@ -1544,6 +1640,7 @@ function attemptBoundaryHydration<Root, Instance>(
 
   hydration.beginScope(parent, start);
   const queued: PendingProperties<Instance>[] = [];
+  const effectMark = context.effects === null ? 0 : context.effects.length;
   const wasHydrating = context.hydrating;
   const wasPending = context.pendingProps;
   context.hydrating = true;
@@ -1558,6 +1655,8 @@ function attemptBoundaryHydration<Root, Instance>(
     } catch (thrown) {
       // A wakeable only means the data is late; anything else is a mismatch.
       dropStagedWaits(context, contentKey);
+      // The attempt did not stand, so the effects it read are not owed.
+      if (context.effects !== null) context.effects.length = effectMark;
       if (isThenable(thrown)) return { status: "suspended", thenable: thrown };
       return { status: "mismatched" };
     }
@@ -1581,24 +1680,29 @@ function retryBoundaryHydration<Root, Instance>(
   start: Instance,
   end: Instance,
 ): void {
-  if (context.hydration !== null && context.host.getCommentText(start) === "$") {
-    const attempt = attemptBoundaryHydration(context, props.children, contentKey, parent, start);
-    if (attempt.status === "hydrated") {
-      applyPendingProperties(context, attempt.queued);
-      return;
+  try {
+    if (context.hydration !== null && context.host.getCommentText(start) === "$") {
+      const attempt = attemptBoundaryHydration(context, props.children, contentKey, parent, start);
+      if (attempt.status === "hydrated") {
+        applyPendingProperties(context, attempt.queued);
+        return;
+      }
+      if (attempt.status === "suspended") {
+        // Still not ready. The markup is untouched, so try hydration again later.
+        suspendBoundary(context, contentKey, attempt.thenable, () =>
+          retryBoundaryHydration(context, props, contentKey, fallbackKey, parent, start, end),
+        );
+        return;
+      }
     }
-    if (attempt.status === "suspended") {
-      // Still not ready. The markup is untouched, so try hydration again later.
-      suspendBoundary(context, contentKey, attempt.thenable, () =>
-        retryBoundaryHydration(context, props, contentKey, fallbackKey, parent, start, end),
-      );
-      return;
-    }
-  }
 
-  // Either there is no markup to reuse (`$?`/`$~`) or hydration cannot match
-  // what the server sent, so only a client render can settle this boundary.
-  clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end);
+    // Either there is no markup to reuse (`$?`/`$~`) or hydration cannot match
+    // what the server sent, so only a client render can settle this boundary.
+    clientRenderBoundary(context, props, contentKey, fallbackKey, parent, start, end);
+  } finally {
+    // No pass sits above a retry, so it commits whatever it rendered itself.
+    context.flushEffects();
+  }
 }
 
 /** Replace whatever sits between a boundary's markers with `staged`. */
@@ -1713,6 +1817,8 @@ export function createRenderer<Root, Instance>(
 ): Renderer<Root> {
   /** Only a host that patches and a driver that can re-render support updates. */
   const canUpdate = options.rerender !== undefined && (host.patch ?? null) !== null;
+  /** Only a target that keeps its tree can run effects; a serializer cannot. */
+  const canRunEffects = (host.patch ?? null) !== null;
   /** Components whose queued state still has to be applied. */
   const dirty = new Set<ComponentInstance>();
   /** Components that dispatched while a pass was running; that pass may cover them. */
@@ -1741,7 +1847,111 @@ export function createRenderer<Root, Instance>(
     clientBoundaries: new Map(),
     rendering: false,
     afterPass,
+    effects: canRunEffects ? [] : null,
+    cleanups: [],
+    flushEffects,
   };
+
+  /** Effects a target never runs (a serializer) are dropped as they are read. */
+  const effects = context.effects;
+  /** The timer the passive phase waits on; `null` when nothing is owed. */
+  let passiveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Run one phase of what the commit recorded: every cleanup, then every create. */
+  function runEffects(layout: boolean): void {
+    if (effects === null) return;
+
+    // Take the phase's work first, so a callback that renders cannot shuffle it.
+    const owed: PendingEffect[] = [];
+    for (let i = 0; i < effects.length;) {
+      const pending = effects[i];
+      if (pending.hook.layout !== layout) {
+        i++;
+        continue;
+      }
+      effects.splice(i, 1);
+      // Unmounted before this phase ran: the tree never committed it.
+      if (context.instances.get(pending.instance.key) !== pending.instance) continue;
+      if (pending.hook.ran && areDepsEqual(pending.hook.committedDeps, pending.deps)) continue;
+      owed.push(pending);
+    }
+
+    const cleanups: EffectHook[] = [];
+    for (let i = 0; i < context.cleanups.length;) {
+      const hook = context.cleanups[i];
+      if (hook.layout !== layout) {
+        i++;
+        continue;
+      }
+      context.cleanups.splice(i, 1);
+      cleanups.push(hook);
+    }
+
+    // As in React, nothing is created until the phase has dropped every effect
+    // it owns, so no cleanup ever sees a half-updated tree.
+    for (const hook of cleanups) destroyEffect(hook);
+    for (const pending of owed) destroyEffect(pending.hook);
+
+    // The pass recorded effects children first, so the creates already run bottom-up.
+    for (const pending of owed) {
+      const hook = pending.hook;
+      hook.ran = true;
+      hook.committedDeps = pending.deps === undefined ? undefined : pending.deps.slice();
+      const destroy = pending.create();
+      hook.destroy = typeof destroy === "function" ? destroy : undefined;
+    }
+  }
+
+  /** Drop one hook's cleanup; a component that left the tree runs it one last time. */
+  function destroyEffect(hook: EffectHook): void {
+    hook.ran = false;
+    const destroy = hook.destroy;
+    hook.destroy = undefined;
+    destroy?.();
+  }
+
+  /** Whether a phase still owes passive work, so a timer is worth scheduling. */
+  function owesPassive(): boolean {
+    if (effects === null) return false;
+    return (
+      effects.some((pending) => !pending.hook.layout) ||
+      context.cleanups.some((hook) => !hook.layout)
+    );
+  }
+
+  /**
+   * Passive effects wait for the next task, so the commit finishes and the
+   * browser gets to paint before anything runs.
+   */
+  function schedulePassive(): void {
+    if (passiveTimer !== null || !owesPassive()) return;
+    passiveTimer = setTimeout(() => {
+      passiveTimer = null;
+      runEffects(false);
+      afterPass();
+    }, 0);
+  }
+
+  /**
+   * A passive phase is a commit of its own: a render that starts while one is
+   * owed has to let it finish first, or the effect would read the newer tree.
+   */
+  function flushPassiveEffects(): void {
+    if (context.rendering || passiveTimer === null) return;
+    clearTimeout(passiveTimer);
+    passiveTimer = null;
+    runEffects(false);
+  }
+
+  /**
+   * Work nested inside a pass leaves its effects to the pass that started it,
+   * so only the outermost frame of a commit runs them.
+   */
+  function flushEffects(): void {
+    if (context.rendering || effects === null) return;
+    runEffects(true);
+    schedulePassive();
+  }
 
   function schedule(instance: ComponentInstance): void {
     if (!canUpdate) return;
@@ -1777,6 +1987,8 @@ export function createRenderer<Root, Instance>(
     if (!canUpdate) return;
     flushing = true;
     try {
+      // A render may only start once the passive phase it follows has run.
+      flushPassiveEffects();
       while (dirty.size > 0) {
         const instance = shallowest();
         dirty.delete(instance);
@@ -1802,13 +2014,20 @@ export function createRenderer<Root, Instance>(
 
   return {
     render(element) {
+      // The passive phase of the previous commit belongs before this pass.
+      flushPassiveEffects();
       context.rendering = true;
+      let rendered = false;
       try {
         const root = host.createRoot();
         renderPass(context, element, root);
+        rendered = true;
         return root;
       } finally {
         context.rendering = false;
+        // A pass that threw left no tree, so nothing it read is owed.
+        if (!rendered && effects !== null) effects.length = 0;
+        if (rendered) flushEffects();
         afterPass();
       }
     },
@@ -1816,11 +2035,15 @@ export function createRenderer<Root, Instance>(
       const hydration = context.hydration;
       if (hydration === null) throw new Error("This target cannot hydrate.");
 
+      // The passive phase of the previous commit belongs before this pass.
+      flushPassiveEffects();
+
       /** Settled retries wait until the pass stops claiming nodes. */
       const suspended: DeferredSuspension[] = [];
       /** Listeners and attributes are applied only if this attempt commits. */
       const queued: PendingProperties<Instance>[] = [];
       let committed = false;
+      let rendered = false;
 
       context.rendering = true;
       try {
@@ -1832,6 +2055,7 @@ export function createRenderer<Root, Instance>(
           try {
             renderPass(context, element, root);
             committed = true;
+            rendered = true;
           } catch (error) {
             if (!(error instanceof HydrationMismatchError)) throw error;
 
@@ -1844,9 +2068,11 @@ export function createRenderer<Root, Instance>(
             context.instances.clear();
             context.rendered.clear();
             context.stagedRanges.clear();
+            if (effects !== null) effects.length = 0;
             context.hydrating = false;
             hydration.clear(root);
             renderPass(context, element, root);
+            rendered = true;
           }
         } finally {
           context.hydrating = false;
@@ -1860,10 +2086,27 @@ export function createRenderer<Root, Instance>(
         for (const { thenable, retry } of suspended) context.onSuspend(thenable, retry);
       } finally {
         context.rendering = false;
+        if (!rendered && effects !== null) effects.length = 0;
+        if (rendered) flushEffects();
         afterPass();
       }
     },
     reset() {
+      // The tree is going away, so whatever it ran owes a cleanup now.
+      if (effects !== null) {
+        // A passive phase nobody has run yet dies with the tree it belongs to.
+        if (passiveTimer !== null) clearTimeout(passiveTimer);
+        passiveTimer = null;
+        effects.length = 0;
+        for (const instance of context.instances.values()) {
+          for (const hook of instance.hooks) {
+            const effect = hook.effect;
+            if (effect !== undefined && effect.ran) context.cleanups.push(effect);
+          }
+        }
+        runEffects(true);
+        runEffects(false);
+      }
       dirty.clear();
       queuedDuringPass.clear();
       context.instances.clear();

@@ -190,6 +190,15 @@ export function use<T>(thenable: Thenable<T>): T {
 //
 // The API lives here; the storage lives in the renderer.
 
+/** Runs after the commit; may return a cleanup that runs before the next run. */
+export type EffectCallback = () => void | (() => void);
+
+/**
+ * A dependency list. `undefined` means "no list", which re-runs the effect on
+ * every render; a list (even an empty one) is compared item by item.
+ */
+export type DependencyList = unknown[];
+
 export interface Dispatcher {
   useState<S>(initialState: S | (() => S)): [S, (action: S | ((previous: S) => S)) => void];
   useReducer<S, A>(
@@ -199,6 +208,8 @@ export interface Dispatcher {
   ): [S, (action: A) => void];
   useRef<T>(initialValue: T): { current: T };
   useMemo<T>(factory: () => T, deps: unknown[] | undefined): T;
+  useEffect(create: EffectCallback, deps: DependencyList | undefined): void;
+  useLayoutEffect(create: EffectCallback, deps: DependencyList | undefined): void;
 }
 
 export const ReactSharedInternals: { currentDispatcher: Dispatcher | null } = {
@@ -242,4 +253,14 @@ export function useCallback<T extends (...args: Any[]) => Any>(
   deps: unknown[] | undefined,
 ): T {
   return useMemo(() => callback, deps);
+}
+
+/** Run after the browser can paint; a target that only serializes never runs it. */
+export function useEffect(create: EffectCallback, deps?: DependencyList): void {
+  resolveDispatcher().useEffect(create, deps);
+}
+
+/** Run before the browser paints, while the committed tree is readable. */
+export function useLayoutEffect(create: EffectCallback, deps?: DependencyList): void {
+  resolveDispatcher().useLayoutEffect(create, deps);
 }

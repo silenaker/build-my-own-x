@@ -380,8 +380,10 @@ function createRootControls(container: Element): RootControls {
       renderer.hydrate(element, container);
     },
     unmount(): void {
-      clearChildren(container);
+      // Cleanups run while the container is still populated, so an effect that
+      // reads the DOM sees what it produced.
       renderer.reset();
+      clearChildren(container);
       waiting.clear();
       mounted = false;
       rootElement = null;
