@@ -2150,7 +2150,7 @@ const ENUMERATED_BOOLEAN_ATTRIBUTES = new Set([
 /** `onClick` -> `click`; only `on` + a capital letter is an event. */
 const EVENT_PROP = /^on[A-Z]/;
 
-function normalizeProperties(props: Any): NormalizedProperties {
+export function normalizeProperties(props: Any): NormalizedProperties {
   const attributes: Array<[string, string]> = [];
   const events: Array<[string, Any]> = [];
   let innerHTML: string | null = null;

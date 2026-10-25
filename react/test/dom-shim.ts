@@ -2,7 +2,7 @@
  * `createRoot` needs only a small slice of the DOM. This shim provides exactly
  * that slice so tests can mount and inspect trees without a browser.
  */
-import { createRoot } from "../react-dom-client.ts";
+import { createRoot, type ReactDomRoot } from "../react-dom-client.ts";
 import { type Any } from "../shared.ts";
 
 export class TestNode {
@@ -155,11 +155,14 @@ function textOf(node: TestNode): string {
   return "";
 }
 
+/** A root factory a test can pick; `createRoot` is the default client. */
+export type RootFactory = (container: Element) => ReactDomRoot;
+
 /** `createRoot(...).render(element)` into a fresh container, then return it. */
-export function mount(element: Any): TestElement {
+export function mount(element: Any, create: RootFactory = createRoot): TestElement {
   const document = new TestDocument();
   const container = document.createElement("root");
-  createRoot(container as unknown as Element).render(element);
+  create(container as unknown as Element).render(element);
   return container;
 }
 
