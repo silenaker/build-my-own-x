@@ -146,6 +146,17 @@ interface HookSlot {
   deps?: unknown[];
 }
 
+/**
+ * Something whose committed output the update path has to locate among a
+ * parent's children: a component's output, or the range a boundary owns.
+ */
+interface RangeOwner {
+  /** Host parent the output was committed to, or `null` while it has no stable location. */
+  parent: Any;
+  /** Nodes the committed output occupies, or `null` when only a root pass can locate it. */
+  output: Any[] | null;
+}
+
 interface ComponentInstance {
   hooks: HookSlot[];
   /** Ordinal of the next hook call. */
@@ -371,8 +382,12 @@ interface RenderContext<Root, Instance> {
   waits: Map<string, BoundaryWait>;
   /** Apply one component's queued state, either in place or as part of a root pass. */
   schedule: (instance: ComponentInstance) => void;
-  /** Nesting depth of staging roots; output rendered there has no stable location yet. */
-  staging: number;
+  /**
+   * Output ranges recorded inside a staging root, keyed by that root. A staged
+   * node has no parent in the document yet, so each range is settled by the
+   * commit that moves the root into the tree (or dropped with the root).
+   */
+  stagedRanges: Map<Any, StagedRange[]>;
   /** Client boundaries by path, so a retry can find the range it owns. */
   clientBoundaries: Map<string, ClientBoundary>;
   /** True while a scheduled retry is walking, so dispatches queue instead of re-entering. */
@@ -405,6 +420,16 @@ interface PendingProperties<Instance> {
   properties: NormalizedProperties;
   /** The element's path, so a suspended attempt drops only its own work. */
   key: string;
+}
+
+/**
+ * An output range recorded inside a staging root. The nodes keep their
+ * identity when the root commits, so only the parent is unknown until then.
+ */
+interface StagedRange {
+  owner: RangeOwner;
+  /** Nodes the owner emitted, in the order it emitted them. */
+  nodes: Any[];
 }
 
 /** The element tree and the server markup cannot be lined up node for node. */
@@ -737,22 +762,47 @@ function renderComponent<Root, Instance>(
   instance.outputKey = outputKey;
 
   const patch = context.patch;
-  // Only a settled pass into a real parent can name the nodes an update will replace.
-  if (patch !== null && !context.hydrating && context.staging === 0) {
-    instance.parent = parent;
+  // Every pass that creates nodes can name the range an update will replace; a
+  // staged parent settles its range once the root commits into the document.
+  if (patch !== null && !context.hydrating) {
     const start = patch.position(parent);
     renderInScope(context, outputKey, () => {
       renderNode(context, output, parent);
     });
-    instance.output = patch.nodesBetween(parent, start);
+    recordOutput(context, instance, parent, patch.nodesBetween(parent, start));
     return;
   }
 
-  // A staged or hydrating subtree may still move, so an update has to use the root.
+  // A hydrating subtree reuses the nodes the server left, so only a root pass
+  // can locate this output again.
   instance.output = null;
   renderInScope(context, outputKey, () => {
     renderNode(context, output, parent);
   });
+}
+
+/**
+ * Name the nodes an owner's output occupies. Nodes appended to a staging root
+ * have no parent in the document yet, so the range waits for the commit that
+ * moves them into the tree; anywhere else the range is final right away.
+ */
+function recordOutput<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  owner: RangeOwner,
+  parent: Root | Instance,
+  nodes: Any[],
+): void {
+  const staged = context.stagedRanges.get(parent);
+  if (staged !== undefined) {
+    // Until the root commits there is no slot to name, so pretending otherwise
+    // would let an update patch a range that is not in the tree.
+    owner.parent = null;
+    owner.output = null;
+    staged.push({ owner, nodes });
+    return;
+  }
+  owner.parent = parent;
+  owner.output = nodes;
 }
 
 /** Run the component with its hooks bound to `instance`. */
@@ -781,7 +831,7 @@ function invokeComponent(instance: ComponentInstance, component: Any, props: Any
 }
 
 /** What a targeted update achieved, so the scheduler knows whether it still owes work. */
-type UpdateResult = "rendered" | "stale" | "fallback";
+type UpdateResult = "rendered" | "stale" | "fallback" | "suspended";
 
 /**
  * Re-run one component where its output already sits. Only that output range is
@@ -822,13 +872,9 @@ function renderComponentUpdate<Root, Instance>(
       const output = invokeComponent(instance, instance.type, instance.props);
       renderNode(context, output, parent);
     } catch (thrown) {
-      // The boundary that could catch this is not on the stack of a scoped pass.
-      if (isThenable(thrown)) {
-        throw new Error(
-          "A component suspended while rendering synchronously, but no <Suspense> boundary " +
-            "was found. Await the tree first (e.g. `await deepAwait(root)`) before rendering it.",
-        );
-      }
+      // The boundary that could catch this is above the scope this pass started
+      // in, so only a root pass can put it back on the stack.
+      if (isThenable(thrown)) return "suspended";
       throw thrown;
     }
 
@@ -909,7 +955,7 @@ function renderSuspense<Root, Instance>(
     return;
   }
 
-  context.host.commitStaged(parent, staged);
+  commitStagedRoot(context, parent, staged);
   context.host.appendChild(parent, context.host.createCommentInstance("/$"));
   tracker.finish(id);
 }
@@ -924,9 +970,9 @@ function renderSuspenseContent<Root, Instance>(
   parent: Root | Instance,
 ): void {
   const patch = context.patch;
-  // A staging root has no settled position, so only a real parent can name a range.
-  const start =
-    patch !== null && !context.hydrating && context.staging === 0 ? patch.position(parent) : -1;
+  // A staged parent has no cursor in the document, but its own children are
+  // still numbered, so the range is just settled later, when it commits.
+  const start = patch !== null && !context.hydrating ? patch.position(parent) : -1;
   const record =
     patch === null
       ? null
@@ -942,11 +988,11 @@ function renderSuspenseContent<Root, Instance>(
     dropStagedWaits(context, contentKey);
     renderBoundaryFallback(context, props.fallback, fallbackKey, parent);
     if (start >= 0 && record !== null && patch !== null) {
-      record.output = patch.nodesBetween(parent, start);
+      recordOutput(context, record, parent, patch.nodesBetween(parent, start));
       record.pending = true;
       suspendContent(context, contentKey, thrown, record.retry);
     } else {
-      // Only a real parent can be retried in place; a staged render reuses the root.
+      // Without a range to replace, only a root pass can find the boundary again.
       if (record !== null) {
         record.output = null;
         record.pending = false;
@@ -955,9 +1001,13 @@ function renderSuspenseContent<Root, Instance>(
     }
     return;
   }
-  context.host.commitStaged(parent, staged);
+  commitStagedRoot(context, parent, staged);
   if (record !== null) {
-    record.output = start >= 0 && patch !== null ? patch.nodesBetween(parent, start) : null;
+    if (start >= 0 && patch !== null) {
+      recordOutput(context, record, parent, patch.nodesBetween(parent, start));
+    } else {
+      record.output = null;
+    }
     record.pending = false;
   }
 }
@@ -1011,7 +1061,7 @@ function retryClientBoundary<Root, Instance>(
 
   const parent = record.parent as Root | Instance;
   const previous = record.output;
-  if (previous === null || previous.length === 0 || context.staging !== 0 || context.hydrating) {
+  if (previous === null || previous.length === 0 || context.hydrating) {
     // Without a settled range there is nothing scoped to replace.
     context.rerender();
     return;
@@ -1043,7 +1093,7 @@ function retryClientBoundary<Root, Instance>(
     }
 
     for (const node of previous) patch.remove(parent, node as Instance);
-    context.host.commitStaged(parent, staged);
+    commitStagedRoot(context, parent, staged);
     record.output = patch.nodesBetween(parent, start);
     record.pending = false;
     record.pass = context.pass;
@@ -1067,18 +1117,60 @@ function renderBoundaryChildren<Root, Instance>(
   const previous = tracker === null ? null : tracker.parent;
   if (tracker !== null) tracker.parent = id;
   try {
-    const staged = context.host.createStagingRoot();
-    context.staging++;
-    try {
-      renderInScope(context, contentKey, () => {
-        renderNode(context, children, staged);
-      });
-    } finally {
-      context.staging--;
-    }
-    return staged;
+    return renderIntoStagingRoot(context, contentKey, children);
   } finally {
     if (tracker !== null) tracker.parent = previous;
+  }
+}
+
+/**
+ * Render `children` into a detached root. Output recorded there cannot name a
+ * parent yet, so an attempt that throws drops its ranges with the root.
+ */
+function renderIntoStagingRoot<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  key: string,
+  children: Any,
+): Root | Instance {
+  const staged = context.host.createStagingRoot();
+  context.stagedRanges.set(staged, []);
+  try {
+    renderInScope(context, key, () => {
+      renderNode(context, children, staged);
+    });
+  } catch (thrown) {
+    // The attempt never reaches the document, so nothing it recorded can settle.
+    context.stagedRanges.delete(staged);
+    throw thrown;
+  }
+  return staged;
+}
+
+/**
+ * Move a staged root into `parent` and settle the ranges recorded inside it.
+ * The nodes keep their identity through the move, so a range only has to be
+ * repointed; a root committed into another staging root stays pending.
+ */
+function commitStagedRoot<Root, Instance>(
+  context: RenderContext<Root, Instance>,
+  parent: Root | Instance,
+  staged: Root | Instance,
+  reference?: Instance | null,
+): void {
+  const ranges = context.stagedRanges.get(staged);
+  context.stagedRanges.delete(staged);
+  context.host.commitStaged(parent, staged, reference);
+  if (ranges === undefined) return;
+
+  const outer = context.stagedRanges.get(parent);
+  if (outer !== undefined) {
+    // The ranges move with their nodes, so they settle when the outer root does.
+    for (const range of ranges) outer.push(range);
+    return;
+  }
+  for (const { owner, nodes } of ranges) {
+    owner.parent = parent;
+    owner.output = nodes;
   }
 }
 
@@ -1093,16 +1185,8 @@ function renderBoundaryFallback<Root, Instance>(
   const previous = tracker === null ? null : tracker.parent;
   if (tracker !== null) tracker.parent = null;
   try {
-    const staged = context.host.createStagingRoot();
-    context.staging++;
-    try {
-      renderInScope(context, fallbackKey, () => {
-        renderNode(context, fallback, staged);
-      });
-    } finally {
-      context.staging--;
-    }
-    context.host.commitStaged(parent, staged);
+    const staged = renderIntoStagingRoot(context, fallbackKey, fallback);
+    commitStagedRoot(context, parent, staged);
   } finally {
     if (tracker !== null) tracker.parent = previous;
   }
@@ -1412,15 +1496,7 @@ function clientRenderBoundary<Root, Instance>(
     if (probe.status === "threw") throw probe.error;
 
     // The content is not ready, so the fallback fills the range until it is.
-    const fallback = context.host.createStagingRoot();
-    context.staging++;
-    try {
-      renderInScope(context, fallbackKey, () => {
-        renderNode(context, props.fallback, fallback);
-      });
-    } finally {
-      context.staging--;
-    }
+    const fallback = renderIntoStagingRoot(context, fallbackKey, props.fallback);
     commitBoundaryRange(context, parent, start, end, fallback);
     // Last, so a synchronous settlement cannot re-enter this frame.
     suspendBoundary(context, contentKey, probe.thenable, () =>
@@ -1534,7 +1610,7 @@ function commitBoundaryRange<Root, Instance>(
   staged: Root | Instance,
 ): void {
   context.host.clearBetween(parent, start, end);
-  context.host.commitStaged(parent, staged, end);
+  commitStagedRoot(context, parent, staged, end);
 }
 
 // ---- Hydration markers -----------------------------------------------------
@@ -1661,7 +1737,7 @@ export function createRenderer<Root, Instance>(
     armed: new Set(),
     waits: new Map(),
     schedule,
-    staging: 0,
+    stagedRanges: new Map(),
     clientBoundaries: new Map(),
     rendering: false,
     afterPass,
@@ -1705,8 +1781,9 @@ export function createRenderer<Root, Instance>(
         const instance = shallowest();
         dirty.delete(instance);
         const result = renderComponentUpdate(context, instance);
-        if (result === "fallback") {
-          // Only a root pass can find output whose range was never recorded.
+        if (result === "fallback" || result === "suspended") {
+          // Only a root pass can find output whose range was never recorded, or
+          // reach the boundary that has to catch a suspension.
           options.rerender?.();
           continue;
         }
@@ -1760,11 +1837,13 @@ export function createRenderer<Root, Instance>(
 
             // The markup cannot be lined up with the tree, so the client takes
             // the root over. Hooks and host work from the attempt must not
-            // survive, and neither do the retries it armed.
+            // survive, and neither do the retries it armed or the ranges it
+            // staged.
             suspended.length = 0;
             queued.length = 0;
             context.instances.clear();
             context.rendered.clear();
+            context.stagedRanges.clear();
             context.hydrating = false;
             hydration.clear(root);
             renderPass(context, element, root);
@@ -1792,6 +1871,7 @@ export function createRenderer<Root, Instance>(
       context.clientBoundaries.clear();
       context.armed.clear();
       context.waits.clear();
+      context.stagedRanges.clear();
       context.patch?.reset();
     },
   };

@@ -19,6 +19,7 @@ import { delay, until } from "./helpers.ts";
 
 describe("suspense", () => {
   const never = new Promise<never>(() => {});
+  const click = (node: Any): void => asElement(node).dispatch("click", {});
 
   /** Throws the same pending thenable on every read. */
   function Suspends() {
@@ -541,6 +542,231 @@ describe("suspense", () => {
     settle();
     await until(() => container.textContent === "armcount:2");
   });
+
+  it("retries an inner boundary without re-rendering the outer content", async () => {
+    const calls = { outer: 0, inner: 0, sibling: 0 };
+    let settle!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => (settle = resolve));
+
+    function Async() {
+      calls.inner++;
+      return createElement("b", { children: use(pending) });
+    }
+    function Sibling() {
+      calls.sibling++;
+      return createElement("i", { children: "s" });
+    }
+    function Outer() {
+      calls.outer++;
+      return createElement("div", {
+        children: [
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "inner-wait",
+            children: createElement(Async, {}),
+          }),
+          createElement(Sibling, {}),
+        ],
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "outer-wait",
+        children: createElement(Outer, {}),
+      }),
+    );
+    expect(container.textContent).toBe("inner-waits");
+
+    // The inner boundary committed into the outer staging root, so its range
+    // only settles once that root reaches the document; the retry uses it.
+    settle("ready");
+    await until(() => container.textContent === "readys");
+    expect(calls).toEqual({ outer: 1, inner: 2, sibling: 1 });
+  });
+
+  it("updates a component in place once a retry has replaced the content", async () => {
+    const calls = { app: 0, counter: 0 };
+    let suspend = false;
+    let settle!: () => void;
+    let pending: Promise<void> | null = null;
+
+    function Counter() {
+      calls.counter++;
+      const [count, setCount] = useState(0);
+      if (suspend) {
+        pending ??= new Promise<void>((resolve) => (settle = resolve));
+        use(pending);
+      }
+      return createElement("button", {
+        onClick: () => {
+          suspend = true;
+          setCount(count + 1);
+        },
+        children: "c" + count,
+      });
+    }
+    function App() {
+      calls.app++;
+      return createElement("div", { children: createElement(Counter, {}) });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement(App, {}),
+      }),
+    );
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("loading");
+
+    settle();
+    await until(() => container.textContent === "c1");
+
+    // The retried content named the ranges its nodes now occupy, so this update
+    // only re-renders the counter.
+    suspend = false;
+    const before = { ...calls };
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("c2");
+    expect(calls).toEqual({ app: before.app, counter: before.counter + 1 });
+  });
+
+  it("updates a component inside a fallback in place", () => {
+    const never = new Promise<never>(() => {});
+    const calls = { fallback: 0 };
+
+    function Never() {
+      use(never);
+      return null;
+    }
+    function Fallback() {
+      calls.fallback++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "f" + count,
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: createElement(Fallback, {}),
+        children: createElement(Never, {}),
+      }),
+    );
+    expect(container.textContent).toBe("f0");
+
+    click(container.childNodes[0]);
+    expect(container.textContent).toBe("f1");
+    expect(calls.fallback).toBe(2);
+  });
+
+  it("drops the ranges of an outer attempt that suspends after an inner boundary committed", async () => {
+    const calls = { shell: 0, counter: 0 };
+    let settle!: () => void;
+    let pending: Promise<void> | null = null;
+    let slow = false;
+
+    function Slow() {
+      pending ??= new Promise<void>((resolve) => (settle = resolve));
+      use(pending);
+      return null;
+    }
+    function Counter() {
+      calls.counter++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "c" + count,
+      });
+    }
+    function Shell() {
+      calls.shell++;
+      const [armed, setArmed] = useState(false);
+      return createElement("div", {
+        children: [
+          createElement("button", {
+            onClick: () => {
+              slow = true;
+              setArmed(true);
+            },
+            children: "arm",
+          }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "inner-wait",
+            children: createElement(Counter, {}),
+          }),
+          armed && slow ? createElement(Slow, {}) : null,
+        ],
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "outer-wait",
+        children: createElement(Shell, {}),
+      }),
+    );
+    expect(container.textContent).toBe("armc0");
+
+    // The inner boundary commits into the outer staging root and then the outer
+    // attempt throws, so every range recorded in it must go with it.
+    click(asElement(container.childNodes[0]).childNodes[0]);
+    expect(container.textContent).toBe("outer-wait");
+
+    slow = false;
+    settle();
+    await until(() => container.textContent === "armc0");
+
+    const before = { ...calls };
+    click(asElement(container.childNodes[0]).childNodes[1]);
+    expect(container.textContent).toBe("armc1");
+    expect(calls).toEqual({ shell: before.shell, counter: before.counter + 1 });
+  });
+
+  it("recovers from an update that wrote part of its output before suspending", async () => {
+    let settle!: () => void;
+    let gate: Promise<void> | null = null;
+    let slow = false;
+
+    function Slow() {
+      gate ??= new Promise<void>((resolve) => (settle = resolve));
+      use(gate);
+      return null;
+    }
+    function Child() {
+      const [count, setCount] = useState(0);
+      const items: Any[] = [];
+      for (let i = 0; i < count; i++) items.push(createElement("i", { children: String(i) }));
+      if (slow) items.push(createElement(Slow, {}));
+      return createElement("button", {
+        onClick: () => {
+          slow = true;
+          setCount(count + 1);
+        },
+        children: items,
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement(Child, {}),
+      }),
+    );
+    expect(asElement(container.childNodes[0]).childNodes).toHaveLength(0);
+
+    // The scoped pass places the first item and then throws; only a root pass can
+    // put the boundary back on the stack, and the partial output must not leak.
+    click(asElement(container.childNodes[0]));
+    expect(container.textContent).toBe("loading");
+
+    slow = false;
+    settle();
+    await until(() => container.textContent === "0");
+    expect(container.childNodes).toHaveLength(1);
+    expect(asElement(container.childNodes[0]).childNodes).toHaveLength(1);
+  });
 });
 
 describe("component identity", () => {
@@ -855,6 +1081,78 @@ describe("targeted updates", () => {
     click(div.childNodes[1]);
     expect(calls).toEqual({ a: 2, b: 2 });
     expect(div.textContent).toBe("a1b1");
+  });
+
+  it("re-renders only the component whose state changed inside a boundary", () => {
+    const calls = { app: 0, counter: 0, sibling: 0 };
+
+    function Counter() {
+      calls.counter++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "c" + count,
+      });
+    }
+    function Sibling() {
+      calls.sibling++;
+      return createElement("span", { children: "s" });
+    }
+    function App() {
+      calls.app++;
+      return createElement("div", {
+        children: [createElement(Counter, {}), createElement(Sibling, {})],
+      });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "loading",
+        children: createElement(App, {}),
+      }),
+    );
+    expect(calls).toEqual({ app: 1, counter: 1, sibling: 1 });
+
+    // The content was staged, so its ranges settle when the boundary commits.
+    click(asElement(container.childNodes[0]).childNodes[0]);
+
+    expect(calls).toEqual({ app: 1, counter: 2, sibling: 1 });
+    expect(container.textContent).toBe("c1s");
+  });
+
+  it("re-renders in place when the boundary is nested in another one", () => {
+    const calls = { app: 0, counter: 0 };
+
+    function Counter() {
+      calls.counter++;
+      const [count, setCount] = useState(0);
+      return createElement("button", {
+        onClick: () => setCount(count + 1),
+        children: "c" + count,
+      });
+    }
+    function App() {
+      calls.app++;
+      return createElement("div", { children: createElement(Counter, {}) });
+    }
+
+    const container = mount(
+      createElement(REACT_SUSPENSE_TYPE, {
+        fallback: "outer",
+        children: createElement(REACT_SUSPENSE_TYPE, {
+          fallback: "inner",
+          children: createElement(App, {}),
+        }),
+      }),
+    );
+    expect(calls).toEqual({ app: 1, counter: 1 });
+
+    // The inner content commits into the outer boundary's staging root first, so
+    // its ranges stay pending until that root reaches the document.
+    click(asElement(container.childNodes[0]).childNodes[0]);
+
+    expect(calls).toEqual({ app: 1, counter: 2 });
+    expect(container.textContent).toBe("c1");
   });
 });
 
