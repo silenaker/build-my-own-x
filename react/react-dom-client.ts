@@ -1,5 +1,11 @@
 /**
  * The DOM host, `createRoot` and `hydrateRoot`.
+ *
+ * Two clients share this host. `createRoot` drives the streaming walker in
+ * `react-dom-core.ts`; `createFiberDomRoot` drives the reconciler in
+ * `react-fiber.ts`. Keeping both lets one test hold them to the same output.
+ * Hydration stays on the walker: it already matches Fizz's markers and retries
+ * positionally, and fibers do not hydrate yet.
  */
 
 import {
@@ -8,6 +14,7 @@ import {
   type HydrationNode,
   type PatchConfig,
 } from "./react-dom-core.ts";
+import { createFiberRoot, renderIntoFiberRoot, unmountFiberRoot } from "./react-fiber.ts";
 import type { Any, Thenable } from "./shared.ts";
 
 export interface ReactDomRoot {
@@ -282,10 +289,24 @@ function clearChildren(container: Element): void {
 }
 
 export function createRoot(container: Element): ReactDomRoot {
+  // The reference client: one walker re-reads the whole tree on every pass and
+  // patches what it already mounted.
   const controls = createRootControls(container);
   return {
     render: (element) => controls.render(element),
     unmount: () => controls.unmount(),
+  };
+}
+
+/**
+ * The same root interface, driven by the Fiber reconciler: a double-buffered
+ * tree, a render phase that only builds fibers, and a commit that moves nodes.
+ */
+export function createFiberDomRoot(container: Element): ReactDomRoot {
+  const root = createFiberRoot(container);
+  return {
+    render: (element) => renderIntoFiberRoot(root, element),
+    unmount: () => unmountFiberRoot(root),
   };
 }
 
