@@ -199,6 +199,12 @@ export type EffectCallback = () => void | (() => void);
  */
 export type DependencyList = unknown[];
 
+/**
+ * What `startTransition` accepts: a synchronous scope, or an async one whose
+ * updates after `await` still belong to the transition.
+ */
+export type TransitionScope = () => void | PromiseLike<Any>;
+
 export interface Dispatcher {
   useState<S>(initialState: S | (() => S)): [S, (action: S | ((previous: S) => S)) => void];
   useReducer<S, A>(
@@ -210,10 +216,20 @@ export interface Dispatcher {
   useMemo<T>(factory: () => T, deps: unknown[] | undefined): T;
   useEffect(create: EffectCallback, deps: DependencyList | undefined): void;
   useLayoutEffect(create: EffectCallback, deps: DependencyList | undefined): void;
+  useTransition(): [boolean, (scope: TransitionScope) => void];
 }
 
-export const ReactSharedInternals: { currentDispatcher: Dispatcher | null } = {
+export const ReactSharedInternals: {
+  currentDispatcher: Dispatcher | null;
+  /**
+   * Set by a renderer that can schedule lower-priority work. Updates a scope
+   * dispatches are marked with that renderer's transition lane; targets that
+   * render synchronously leave it `null` and just run the scope.
+   */
+  startTransition: ((scope: () => void) => void) | null;
+} = {
   currentDispatcher: null,
+  startTransition: null,
 };
 
 export function resolveDispatcher(): Dispatcher {
@@ -263,4 +279,21 @@ export function useEffect(create: EffectCallback, deps?: DependencyList): void {
 /** Run before the browser paints, while the committed tree is readable. */
 export function useLayoutEffect(create: EffectCallback, deps?: DependencyList): void {
   resolveDispatcher().useLayoutEffect(create, deps);
+}
+
+/**
+ * Mark every update `scope` dispatches as interruptible work. The updates still
+ * land in order, but a target may render them after urgent updates and keep the
+ * current screen in the meantime. An async scope keeps its transition open
+ * until it settles, so updates after an `await` belong to it as well.
+ */
+export function startTransition(scope: TransitionScope): void {
+  const run = ReactSharedInternals.startTransition;
+  if (run === null) scope();
+  else run(scope);
+}
+
+/** `[isPending, startTransition]`: whether this component's transition still runs. */
+export function useTransition(): [boolean, (scope: TransitionScope) => void] {
+  return resolveDispatcher().useTransition();
 }

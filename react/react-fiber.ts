@@ -37,6 +37,10 @@
  * state + new input" to a description of the change, and commit is an executor
  * that performs that description exactly once.
  *
+ * A lane says how urgent an update is. Transition work renders in slices:
+ * the walk stops between units when the slice's budget runs out, keeps the
+ * fiber it stopped on, and resumes in a later task.
+ *
  */
 
 import {
@@ -47,6 +51,7 @@ import {
   isLazyWrapper,
   type Dispatcher,
   type LazyWrapper,
+  type TransitionScope,
 } from "./react.ts";
 import { normalizeProperties, type NormalizedProperties } from "./react-dom-core.ts";
 import { isThenable, type Any, type Thenable } from "./shared.ts";
@@ -74,12 +79,31 @@ const MutationMask =
 const AllFlags = MutationMask | HasBoundary;
 
 /**
- * A single sync lane. Every update renders at once, so a lane only has to mark
- * *which* fibers are dirty; `childLanes` is what lets an ancestor skip its own
- * render while still descending to the child that changed.
+ * Lanes: every update names the priority it belongs to, and a fiber carries the
+ * union of the lanes that touched it. `lanes` marks the work a fiber itself
+ * owes; `childLanes` marks work somewhere below it, which is what lets an
+ * ancestor skip its own render while still descending to the child that
+ * changed.
+ *
+ * - `SyncLane` is work the screen has to show now: a click, an input, a root
+ *   render, a boundary whose data arrived.
+ * - The transition lanes are work that may wait: everything dispatched inside
+ *   `startTransition`. Every transition claims its own bit, so one of them can
+ *   suspend, finish or be abandoned without touching the others. They render in
+ *   slices and yield to the host, and a higher-priority update abandons an
+ *   unfinished slice and renders first.
  */
 const NoLanes = 0;
-const SyncLane = 1;
+const SyncLane = 1 << 0;
+
+/** How many transitions can be in flight before their lanes are reused. */
+const TRANSITION_LANE_COUNT = 4;
+const FIRST_TRANSITION_LANE = 1 << 1;
+const TransitionLanes =
+  FIRST_TRANSITION_LANE |
+  (FIRST_TRANSITION_LANE << 1) |
+  (FIRST_TRANSITION_LANE << 2) |
+  (FIRST_TRANSITION_LANE << 3);
 
 type Lanes = number;
 
@@ -126,6 +150,16 @@ export interface FiberRoot {
   document: Document;
   current: Fiber;
   pendingLanes: Lanes;
+  /**
+   * Lanes whose work cannot make progress yet (a boundary is waiting on a
+   * thenable). They stay pending, but the scheduler will not pick them up until
+   * the thenable settles.
+   */
+  suspendedLanes: Lanes;
+  /** The pending callback for concurrent work, so urgent work can cancel it. */
+  callbackTimer: Any;
+  /** A concurrent slice is running; work dispatched now waits for it to yield. */
+  isRendering: boolean;
   isFlushing: boolean;
   needsFlush: boolean;
   mounted: boolean;
@@ -330,6 +364,8 @@ const PassiveEffectTag = 2;
 
 interface StateUpdate {
   action: Any;
+  /** The lane the dispatch happened on; an urgent render only runs its own. */
+  lane: Lanes;
 }
 
 interface HookQueue {
@@ -433,12 +469,118 @@ function areDepsEqual(previous: unknown[] | undefined, next: unknown[] | undefin
 }
 
 function dispatchAction(queue: HookQueue, action: Any): void {
-  queue.pending.push({ action });
+  const lane = requestUpdateLane();
+  queue.pending.push({ action, lane });
   const fiber = queue.fiber;
   const root = getRootOfFiber(fiber);
   if (root === null || !root.mounted) return;
-  markUpdateLane(fiber);
-  scheduleFlush(root);
+  markUpdateLane(fiber, lane);
+  ensureRootIsScheduled(root);
+}
+
+/** The lane of the transition whose scope is on the stack, or `NoLanes`. */
+let currentTransitionLane: Lanes = NoLanes;
+/** Round-robin cursor, so a new transition does not reuse a live lane at once. */
+let nextTransitionLane = 0;
+
+/** Transitions whose async scope is still running; their lane stays open. */
+const openAsyncTransitions = new Set<Lanes>();
+
+/** Take a lane for a new transition; a nested scope joins the one it is in. */
+function claimTransitionLane(): Lanes {
+  if (currentTransitionLane !== NoLanes) return currentTransitionLane;
+  const lane = FIRST_TRANSITION_LANE << nextTransitionLane;
+  nextTransitionLane = (nextTransitionLane + 1) % TRANSITION_LANE_COUNT;
+  return lane;
+}
+
+/**
+ * Run a transition scope on `lane`. An async scope keeps the lane open until it
+ * settles: an update after an `await` still belongs to this transition, and
+ * `isPending` stays true while the promise runs.
+ */
+function runTransitionScope(
+  scope: () => void | PromiseLike<Any>,
+  lane: Lanes,
+  onSettled?: () => void,
+): void {
+  const previous = currentTransitionLane;
+  currentTransitionLane = lane;
+
+  let result: void | PromiseLike<Any>;
+  try {
+    result = scope();
+  } catch (error) {
+    currentTransitionLane = previous;
+    throw error;
+  }
+
+  if (isThenable(result)) {
+    openAsyncTransitions.add(lane);
+    Promise.resolve(result).finally(() => {
+      openAsyncTransitions.delete(lane);
+      // Another transition may have taken over while this one was waiting.
+      if (currentTransitionLane === lane) currentTransitionLane = previous;
+      onSettled?.();
+    });
+    return;
+  }
+
+  currentTransitionLane = previous;
+  onSettled?.();
+}
+
+/** The lane an update dispatched right now belongs to. */
+function requestUpdateLane(): Lanes {
+  return currentTransitionLane !== NoLanes ? currentTransitionLane : SyncLane;
+}
+
+/** Dispatch at `SyncLane` even inside a transition; `isPending` is urgent. */
+function dispatchUrgently(dispatch: (pending: boolean) => void, pending: boolean): void {
+  const lane = currentTransitionLane;
+  currentTransitionLane = NoLanes;
+  try {
+    dispatch(pending);
+  } finally {
+    currentTransitionLane = lane;
+  }
+}
+
+/** A `useTransition` waiting for its own transition to finish. */
+interface PendingTransition {
+  /** The component that asked, so unmounting it can drop the entry. */
+  fiber: Fiber;
+  root: FiberRoot | null;
+  /** The lane its scope ran on; the entry is done when the lane is. */
+  lane: Lanes;
+  set: (pending: boolean) => void;
+}
+
+const pendingTransitions = new Set<PendingTransition>();
+
+// The renderer owns what a transition means, so `startTransition` in `react.ts`
+// delegates here. Targets that render synchronously never set it.
+ReactSharedInternals.startTransition = (scope: TransitionScope) => {
+  const lane = claimTransitionLane();
+  runTransitionScope(scope, lane);
+};
+
+/** Clear `isPending` for every transition of `root` that has nothing left. */
+function finishTransitionWork(root: FiberRoot): void {
+  if (pendingTransitions.size === 0) return;
+
+  const finished: PendingTransition[] = [];
+  for (const entry of pendingTransitions) {
+    if (entry.root !== root) continue;
+    // Still waiting on an async scope, or on a lane with work left.
+    if (openAsyncTransitions.has(entry.lane)) continue;
+    if (((root.pendingLanes | root.suspendedLanes) & entry.lane) !== NoLanes) continue;
+    finished.push(entry);
+  }
+  for (const entry of finished) {
+    pendingTransitions.delete(entry);
+    dispatchUrgently(entry.set, false);
+  }
 }
 
 function mountState<S>(hook: Hook, initialState: S | (() => S)): [S, (action: Any) => void] {
@@ -456,18 +598,27 @@ function updateState<S>(hook: Hook): [S, (action: Any) => void] {
   const fiber = requireRenderingFiber();
   queue.fiber = fiber;
 
-  if (queue.pending.length > 0) {
-    let state = hook.baseState as S;
-    for (const update of queue.pending) {
-      state =
-        typeof update.action === "function"
-          ? (update.action as (previous: S) => S)(state)
-          : (update.action as S);
-    }
+  // A transition action belongs to a later render: the urgent render that runs
+  // first must not apply it, or it would commit what the transition deferred.
+  let state = hook.baseState as S;
+  let processed = 0;
+  while (processed < queue.pending.length) {
+    const update = queue.pending[processed];
+    // A lane this render does not cover has to wait, so an urgent pass never
+    // commits what a transition deferred (and vice versa).
+    if ((update.lane & renderLanes) === NoLanes) break;
+    state =
+      typeof update.action === "function"
+        ? (update.action as (previous: S) => S)(state)
+        : (update.action as S);
+    processed++;
+  }
+
+  if (processed > 0) {
     hook.memoizedState = state;
     fiber.flags |= HookState;
   }
-  hook.processed = queue.pending.length;
+  hook.processed = processed;
   return [hook.memoizedState as S, queue.dispatch as (action: Any) => void];
 }
 
@@ -496,16 +647,21 @@ function updateReducer<S, A>(hook: Hook): [S, (action: A) => void] {
   const fiber = requireRenderingFiber();
   queue.fiber = fiber;
 
-  if (queue.pending.length > 0) {
-    const reducer = (queue as Any).reducer as (state: S, action: A) => S;
-    let state = hook.baseState as S;
-    for (const update of queue.pending) {
-      state = reducer(state, update.action as A);
-    }
+  const reducer = (queue as Any).reducer as (state: S, action: A) => S;
+  let state = hook.baseState as S;
+  let processed = 0;
+  while (processed < queue.pending.length) {
+    const update = queue.pending[processed];
+    if ((update.lane & renderLanes) === NoLanes) break;
+    state = reducer(state, update.action as A);
+    processed++;
+  }
+
+  if (processed > 0) {
     hook.memoizedState = state;
     fiber.flags |= HookState;
   }
-  hook.processed = queue.pending.length;
+  hook.processed = processed;
   return [hook.memoizedState as S, queue.dispatch as (action: A) => void];
 }
 
@@ -557,6 +713,40 @@ function readEffect(
   }
 }
 
+/**
+ * `useTransition` stores its `isPending` flag in a state hook and keeps the
+ * setter of that hook in a module set, so the scheduler can clear it when the
+ * last transition lane commits.
+ */
+function readTransition(): [boolean, (scope: () => void | PromiseLike<Any>) => void] {
+  const fiber = requireRenderingFiber();
+  const [isPending, setIsPending] = readState<boolean>(false);
+  const start = readMemo<(scope: () => void | PromiseLike<Any>) => void>(
+    () => (scope) => {
+      const set = setIsPending as (pending: boolean) => void;
+      const root = getRootOfFiber(fiber);
+      const lane = claimTransitionLane();
+
+      // The indicator is urgent, and it is not part of the transition's work.
+      dispatchUrgently(set, true);
+      if (root !== null) pendingTransitions.add({ fiber, root, lane, set });
+
+      try {
+        runTransitionScope(scope, lane, () => {
+          if (root !== null) finishTransitionWork(root);
+        });
+      } catch (error) {
+        // The scope failed before it could finish: nothing is owed, so the
+        // flag must not stick.
+        if (root !== null) finishTransitionWork(root);
+        throw error;
+      }
+    },
+    [],
+  );
+  return [isPending, start];
+}
+
 const hookDispatcher: Dispatcher = {
   useState: readState,
   useReducer: readReducer,
@@ -564,6 +754,7 @@ const hookDispatcher: Dispatcher = {
   useMemo: readMemo,
   useEffect: (create, deps) => readEffect(create, deps, PassiveEffectTag),
   useLayoutEffect: (create, deps) => readEffect(create, deps, LayoutEffectTag),
+  useTransition: readTransition,
 };
 
 /**
@@ -622,12 +813,14 @@ interface BoundaryRecord {
   mounted: boolean;
   /** The thenable the boundary is waiting on, or `null` once content committed. */
   wait: Thenable | null;
+  /** The lane the waiting attempt rendered at, so its retry runs there too. */
+  waitLane: Lanes;
   /** The last committed content, kept alive while the fallback is on screen. */
   stash: Fiber | null;
 }
 
 function createBoundaryRecord(): BoundaryRecord {
-  return { fiber: null, mounted: false, wait: null, stash: null };
+  return { fiber: null, mounted: false, wait: null, waitLane: NoLanes, stash: null };
 }
 
 const waiters = new Map<Thenable, Set<BoundaryRecord>>();
@@ -681,8 +874,13 @@ function pingBoundary(record: BoundaryRecord, thenable: Thenable): void {
   const root = getRootOfFiber(fiber);
   if (root === null || !root.mounted) return;
 
-  markUpdateLane(fiber);
-  scheduleFlush(root);
+  // One settlement, one retry: a new attempt that suspends again stores a new
+  // wait, and that one is what the next settlement has to wake.
+  const lane = record.waitLane;
+  record.wait = null;
+
+  markUpdateLane(fiber, lane);
+  ensureRootIsScheduled(root);
 }
 
 /** Keep a suspended boundary's committed content, and hide its boundaries. */
@@ -702,6 +900,63 @@ function retainSubtree(fiber: Fiber): void {
 
 let renderLanes: Lanes = SyncLane;
 
+// ---- The scheduler ---------------------------------------------------------
+//
+// A concurrent render is resumable: the walk keeps the unit it stopped on, so
+// the next task continues from there instead of starting over. The deadline is
+// refreshed per task, and `shouldYield` is checked between units.
+
+/** How long one concurrent slice may run before it hands the host back. */
+const DEFAULT_FRAME_BUDGET_MS = 5;
+let frameBudgetMs = DEFAULT_FRAME_BUDGET_MS;
+let frameDeadline = 0;
+
+/** Tune the length of a slice; tests set it to `0` to force a yield after each unit. */
+export function setFrameBudgetMs(ms: number): void {
+  frameBudgetMs = ms;
+}
+
+function now(): number {
+  return typeof performance === "object" && performance !== null ? performance.now() : Date.now();
+}
+
+function shouldYield(): boolean {
+  return now() >= frameDeadline;
+}
+
+/** The tree the current concurrent render is building, kept across slices. */
+let workInProgressRoot: FiberRoot | null = null;
+let workInProgressRootFiber: Fiber | null = null;
+let workInProgressUnit: Fiber | null = null;
+let workInProgressLanes: Lanes = NoLanes;
+/** Set when a transition suspended with content on screen: nothing to commit. */
+let renderWasSuspended = false;
+
+function prepareFreshStack(root: FiberRoot, lanes: Lanes): void {
+  workInProgressRoot = root;
+  workInProgressRootFiber = createWorkInProgress(root.current, null);
+  workInProgressUnit = workInProgressRootFiber;
+  workInProgressLanes = lanes;
+  renderWasSuspended = false;
+}
+
+function resetWorkInProgressStack(): void {
+  workInProgressRoot = null;
+  workInProgressRootFiber = null;
+  workInProgressUnit = null;
+  workInProgressLanes = NoLanes;
+  renderWasSuspended = false;
+}
+
+/** The highest-priority work the root can do now; suspended lanes are skipped. */
+function getNextLanes(root: FiberRoot): Lanes {
+  const pending = root.pendingLanes & ~root.suspendedLanes;
+  if (pending === NoLanes) return NoLanes;
+  if ((pending & SyncLane) !== NoLanes) return SyncLane;
+  // Every transition that is not waiting on data renders together.
+  return pending & TransitionLanes;
+}
+
 function getRootOfFiber(fiber: Fiber | null): FiberRoot | null {
   let node = fiber;
   while (node !== null) {
@@ -711,20 +966,24 @@ function getRootOfFiber(fiber: Fiber | null): FiberRoot | null {
   return null;
 }
 
-function markUpdateLane(fiber: Fiber): void {
+function markUpdateLane(fiber: Fiber, lane: Lanes): void {
   // Dispatch closures keep the fiber the hook was mounted on, which may now be
   // the alternate: both sides of every pair have to carry the lane.
-  fiber.lanes |= SyncLane;
-  if (fiber.alternate !== null) fiber.alternate.lanes |= SyncLane;
+  fiber.lanes |= lane;
+  if (fiber.alternate !== null) fiber.alternate.lanes |= lane;
 
   let node = fiber.return;
   while (node !== null) {
-    node.childLanes |= SyncLane;
-    if (node.alternate !== null) node.alternate.childLanes |= SyncLane;
+    node.childLanes |= lane;
+    if (node.alternate !== null) node.alternate.childLanes |= lane;
     node = node.return;
   }
   const root = getRootOfFiber(fiber);
-  if (root !== null) root.pendingLanes |= SyncLane;
+  if (root !== null) {
+    root.pendingLanes |= lane;
+    // New work on a lane is also a reason to try it again.
+    root.suspendedLanes &= ~lane;
+  }
 }
 
 function performUnitOfWork(unitOfWork: Fiber): Fiber | null {
@@ -845,7 +1104,9 @@ function updateSuspenseComponent(workInProgress: Fiber): Fiber | null {
   const current = workInProgress.alternate;
   const record = workInProgress.boundaryRecord ?? current?.boundaryRecord ?? createBoundaryRecord();
   workInProgress.boundaryRecord = record;
-  record.fiber = workInProgress;
+  // Prefer the committed fiber: this pass may be thrown away, and a retry has
+  // to schedule from the tree that is on screen.
+  record.fiber = current ?? workInProgress;
 
   const props: Any = workInProgress.pendingProps ?? {};
   const retry = (workInProgress.lanes & renderLanes) !== NoLanes;
@@ -1064,6 +1325,23 @@ function handleThrowable(thrown: Any, source: Fiber): Fiber | null {
   const current = boundary.alternate;
   const currentSuspended = current !== null && current.memoizedState !== null;
 
+  // A transition that suspends keeps the screen it already has: the attempt is
+  // dropped whole and the boundary waits for the data without a fallback.
+  if ((renderLanes & TransitionLanes) !== NoLanes && current !== null && !currentSuspended) {
+    record.wait = thrown;
+    record.waitLane = renderLanes;
+
+    const root = getRootOfFiber(boundary);
+    // Only the transitions this render covered are suspended: another one keeps
+    // rendering (and committing) while this waits for its data.
+    if (root !== null) root.suspendedLanes |= renderLanes;
+    // No commit will run for this attempt, so nothing else would subscribe.
+    subscribe(record, thrown);
+
+    renderWasSuspended = true;
+    return null;
+  }
+
   // The content on screen is the only thing that can be reused by a retry, so
   // it is detached from the tree instead of being unmounted.
   if (!currentSuspended && current !== null && current.child !== null) {
@@ -1072,6 +1350,7 @@ function handleThrowable(thrown: Any, source: Fiber): Fiber | null {
   }
 
   record.wait = thrown;
+  record.waitLane = renderLanes;
 
   boundary.memoizedState = { suspended: true, thenable: thrown };
   boundary.captured = true;
@@ -1230,6 +1509,13 @@ function unmountSubtree(fiber: Fiber): void {
     unsubscribe(record);
   }
 
+  // A component that leaves the tree can never clear its own pending flag.
+  for (const entry of [...pendingTransitions]) {
+    if (entry.fiber === fiber || entry.fiber.alternate === fiber) {
+      pendingTransitions.delete(entry);
+    }
+  }
+
   // A boundary kept this subtree alive behind its fallback: the nodes go with
   // the fallback, but the hooks keep their state for the retry.
   const keep = retained.delete(fiber);
@@ -1355,22 +1641,29 @@ function runCreate(hook: Hook): void {
   hook.destroy = typeof destroy === "function" ? destroy : null;
 }
 
-function commitBoundaries(fiber: Fiber): void {
+function commitBoundaries(fiber: Fiber, lanes: Lanes): void {
   if (((fiber.flags | fiber.subtreeFlags) & HasBoundary) === NoFlags) return;
 
   if (fiber.tag === SuspenseComponent && fiber.boundaryRecord !== undefined) {
     const record = fiber.boundaryRecord;
+    record.fiber = fiber;
     record.mounted = true;
     if (fiber.memoizedState === null) {
-      record.wait = null;
-      record.stash = null;
+      // Content committed. Only the lane that armed the wait can retire it:
+      // another lane's commit may have re-rendered the same boundary while it
+      // was still waiting on a different transition.
+      if ((record.waitLane & lanes) !== NoLanes) {
+        record.wait = null;
+        record.waitLane = NoLanes;
+        record.stash = null;
+      }
     } else if (record.wait !== null) {
       subscribe(record, record.wait);
     }
   }
   let child = fiber.child;
   while (child !== null) {
-    commitBoundaries(child);
+    commitBoundaries(child, lanes);
     child = child.sibling;
   }
 }
@@ -1398,7 +1691,7 @@ function clearLanes(fiber: Fiber, lanes: Lanes): void {
   }
 }
 
-function commitRoot(root: FiberRoot, finishedWork: Fiber): void {
+function commitRoot(root: FiberRoot, finishedWork: Fiber, lanes: Lanes): void {
   const lists: CommitLists = {
     layoutDestroys: [],
     layoutCreates: [],
@@ -1409,7 +1702,7 @@ function commitRoot(root: FiberRoot, finishedWork: Fiber): void {
   commitMutationEffects(finishedWork, lists);
 
   root.current = finishedWork;
-  commitBoundaries(finishedWork);
+  commitBoundaries(finishedWork, lanes);
 
   // Every cleanup of the phase runs before any create, so no effect observes a
   // half-updated tree.
@@ -1440,7 +1733,7 @@ function runPassive(root: FiberRoot): void {
   root.passive = null;
   for (const hook of work.destroys) runDestroy(hook);
   for (const hook of work.creates) runCreate(hook);
-  if (root.pendingLanes !== NoLanes && !root.isFlushing) flushRoot(root);
+  if (root.pendingLanes !== NoLanes && !root.isFlushing) ensureRootIsScheduled(root);
 }
 
 /** A passive phase is a commit of its own: a render lets it finish first. */
@@ -1455,64 +1748,219 @@ function flushPassiveEffects(root: FiberRoot): void {
 
 // ---- The root --------------------------------------------------------------
 
-function renderRoot(root: FiberRoot, lanes: Lanes): Fiber {
-  const previousLanes = renderLanes;
-  const previousFiber = currentlyRenderingFiber;
-  const previousHook = workInProgressHook;
-  const previousCurrentHook = currentHook;
+function renderRootSync(root: FiberRoot, lanes: Lanes): Fiber {
+  // Urgent work never resumes a lower-priority tree: that render is dropped.
+  resetWorkInProgressStack();
+  prepareFreshStack(root, lanes);
 
+  const previousLanes = renderLanes;
   renderLanes = lanes;
   try {
-    const workInProgressRoot = createWorkInProgress(root.current, null);
-    let unitOfWork: Fiber | null = workInProgressRoot;
-    while (unitOfWork !== null) {
-      const currentUnit: Fiber = unitOfWork;
+    while (workInProgressUnit !== null) {
+      const unit: Fiber = workInProgressUnit;
       try {
-        unitOfWork = performUnitOfWork(currentUnit);
+        workInProgressUnit = performUnitOfWork(unit);
       } catch (thrown) {
-        unitOfWork = handleThrowable(thrown, currentUnit);
+        workInProgressUnit = handleThrowable(thrown, unit);
       }
     }
-    return workInProgressRoot;
+    return workInProgressRootFiber as Fiber;
   } finally {
     renderLanes = previousLanes;
-    currentlyRenderingFiber = previousFiber;
-    workInProgressHook = previousHook;
-    currentHook = previousCurrentHook;
   }
 }
 
-function flushRoot(root: FiberRoot): void {
+/**
+ * Render until the slice's budget runs out. Returning `null` means the tree is
+ * not finished: either the slice yielded (the work in progress is kept for the
+ * next task) or a transition suspended and the screen was left alone.
+ */
+function renderRootConcurrent(root: FiberRoot, lanes: Lanes): Fiber | null {
+  if (workInProgressRoot !== root || workInProgressLanes !== lanes || workInProgressUnit === null) {
+    prepareFreshStack(root, lanes);
+  }
+
+  const previousLanes = renderLanes;
+  renderLanes = lanes;
+  try {
+    while (workInProgressUnit !== null) {
+      const unit: Fiber = workInProgressUnit;
+      try {
+        workInProgressUnit = performUnitOfWork(unit);
+      } catch (thrown) {
+        workInProgressUnit = handleThrowable(thrown, unit);
+      }
+      if (renderWasSuspended) return null;
+      if (workInProgressUnit !== null && shouldYield()) return null;
+    }
+    return workInProgressRootFiber;
+  } finally {
+    renderLanes = previousLanes;
+  }
+}
+
+/** Render every sync lane to completion, now. */
+function flushSyncWork(root: FiberRoot): void {
   if (root.isFlushing) {
     root.needsFlush = true;
     return;
   }
   root.isFlushing = true;
+  cancelConcurrentCallback(root);
+  pendingSyncRoots.delete(root);
   try {
     do {
       root.needsFlush = false;
       // The passive phase of the previous commit belongs before this render.
       flushPassiveEffects(root);
-      if (root.pendingLanes === NoLanes) break;
+      if ((root.pendingLanes & SyncLane) === NoLanes) break;
 
-      const lanes = root.pendingLanes;
-      root.pendingLanes = NoLanes;
-
-      const finishedWork = renderRoot(root, lanes);
-      clearLanes(finishedWork, lanes);
-      commitRoot(root, finishedWork);
-    } while (root.needsFlush || root.pendingLanes !== NoLanes);
+      root.pendingLanes &= ~SyncLane;
+      const finishedWork = renderRootSync(root, SyncLane);
+      clearLanes(finishedWork, SyncLane);
+      commitRoot(root, finishedWork, SyncLane);
+      resetWorkInProgressStack();
+      finishTransitionWork(root);
+    } while (root.needsFlush || (root.pendingLanes & SyncLane) !== NoLanes);
   } finally {
     root.isFlushing = false;
   }
+
+  if (getNextLanes(root) !== NoLanes) ensureRootIsScheduled(root);
 }
 
-function scheduleFlush(root: FiberRoot): void {
-  if (root.isFlushing) {
+function cancelConcurrentCallback(root: FiberRoot): void {
+  if (root.callbackTimer === null) return;
+  clearTimeout(root.callbackTimer);
+  root.callbackTimer = null;
+}
+
+function scheduleConcurrentWork(root: FiberRoot): void {
+  if (root.callbackTimer !== null || root.isFlushing) return;
+  root.callbackTimer = setTimeout(() => {
+    root.callbackTimer = null;
+    performConcurrentWorkOnRoot(root);
+  }, 0);
+}
+
+// ---- Batching --------------------------------------------------------------
+//
+// A dispatch never renders on the spot. Sync work is queued and flushed in a
+// microtask, once the task that queued it has run to completion, so every
+// update one event (or one promise callback) dispatches lands in a single
+// render. It is also why an urgent update is not observable while the handler
+// that made it is still on the stack.
+
+const pendingSyncRoots = new Set<FiberRoot>();
+let syncFlushQueued = false;
+
+function queueSyncWork(root: FiberRoot): void {
+  pendingSyncRoots.add(root);
+  if (syncFlushQueued) return;
+  syncFlushQueued = true;
+  queueMicrotask(() => {
+    syncFlushQueued = false;
+    flushPendingSyncWork();
+  });
+}
+
+/** Commit every root whose sync work is queued, now. */
+function flushPendingSyncWork(): void {
+  if (pendingSyncRoots.size === 0) return;
+  const roots = [...pendingSyncRoots];
+  pendingSyncRoots.clear();
+  for (const root of roots) {
+    if (root.mounted) flushSyncWork(root);
+  }
+}
+
+/**
+ * Run `scope` and commit the sync work it queued before returning, the way
+ * React's `flushSync` opts out of the batch. Tests use it as their `act`.
+ */
+export function flushSync<T>(scope: () => T): T {
+  try {
+    return scope();
+  } finally {
+    flushPendingSyncWork();
+  }
+}
+
+/** One slice of a concurrent render: render, and commit only if it finished. */
+function performConcurrentWorkOnRoot(root: FiberRoot): void {
+  if (!root.mounted || root.isFlushing) return;
+
+  const lanes = getNextLanes(root);
+  if (lanes === NoLanes) return;
+  if ((lanes & SyncLane) !== NoLanes) {
+    flushSyncWork(root);
+    return;
+  }
+
+  // A passive phase is a commit of its own: finish it before rendering again.
+  flushPassiveEffects(root);
+
+  root.isRendering = true;
+  frameDeadline = now() + frameBudgetMs;
+  let finishedWork: Fiber | null;
+  try {
+    finishedWork = renderRootConcurrent(root, lanes);
+  } finally {
+    root.isRendering = false;
+  }
+
+  if (finishedWork === null) {
+    if (renderWasSuspended) {
+      // Waiting on a thenable: the ping schedules the retry.
+      resetWorkInProgressStack();
+    } else {
+      // Yielded: continue in a fresh task, from the fiber it stopped on.
+      scheduleConcurrentWork(root);
+    }
+    if (root.needsFlush) {
+      root.needsFlush = false;
+      ensureRootIsScheduled(root);
+    }
+    return;
+  }
+
+  root.pendingLanes &= ~lanes;
+  clearLanes(finishedWork, lanes);
+  // Publishing the tree is atomic: an effect that dispatches here queues its
+  // work behind this commit instead of rendering inside it.
+  root.isFlushing = true;
+  try {
+    commitRoot(root, finishedWork, lanes);
+  } finally {
+    root.isFlushing = false;
+  }
+  resetWorkInProgressStack();
+  finishTransitionWork(root);
+
+  root.needsFlush = false;
+  ensureRootIsScheduled(root);
+}
+
+/** Pick the lane to work on and either run it now or hand it to a task. */
+function ensureRootIsScheduled(root: FiberRoot): void {
+  if (!root.mounted) return;
+  if (root.isRendering) {
+    // A slice is running; it decides what to do once it stops.
     root.needsFlush = true;
     return;
   }
-  flushRoot(root);
+
+  const lanes = getNextLanes(root);
+  if (lanes === NoLanes) {
+    cancelConcurrentCallback(root);
+    return;
+  }
+  if ((lanes & SyncLane) !== NoLanes) {
+    // Urgent work is still batched: it commits when the current task ends.
+    queueSyncWork(root);
+    return;
+  }
+  scheduleConcurrentWork(root);
 }
 
 // ---- Public API ------------------------------------------------------------
@@ -1529,6 +1977,9 @@ export function createFiberRoot(container: Element): FiberRoot {
     document,
     current: createFiber(HostRoot, null, null, null),
     pendingLanes: NoLanes,
+    suspendedLanes: NoLanes,
+    callbackTimer: null,
+    isRendering: false,
     isFlushing: false,
     needsFlush: false,
     mounted: true,
@@ -1546,7 +1997,9 @@ export function renderIntoFiberRoot(root: FiberRoot, element: Any): void {
   (root.current.updateQueue as RootQueue).pending.push(element);
   root.current.lanes |= SyncLane;
   root.pendingLanes |= SyncLane;
-  scheduleFlush(root);
+  // An explicit render is the caller asking for this tree now, so it opts out
+  // of the batch that state updates go through.
+  flushSyncWork(root);
 }
 
 /** Drop the tree: cleanups run, the container is emptied, later updates are ignored. */
@@ -1554,6 +2007,13 @@ export function unmountFiberRoot(root: FiberRoot): void {
   if (!root.mounted) return;
   renderIntoFiberRoot(root, null);
   root.mounted = false;
+  cancelConcurrentCallback(root);
+  if (workInProgressRoot === root) resetWorkInProgressStack();
+  root.pendingLanes = NoLanes;
+  root.suspendedLanes = NoLanes;
+  for (const entry of [...pendingTransitions]) {
+    if (entry.root === root) pendingTransitions.delete(entry);
+  }
   if (root.passiveTimer !== null) {
     clearTimeout(root.passiveTimer);
     root.passiveTimer = null;

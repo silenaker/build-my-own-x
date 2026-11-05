@@ -16,7 +16,7 @@
  * reconciliation, properties, `dangerouslySetInnerHTML`, hooks, effects,
  * suspense, teardown and the errors the reconciler raises.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   REACT_FRAGMENT_TYPE,
   REACT_LAZY_TYPE,
@@ -24,6 +24,7 @@ import {
   createElement,
   createLazyWrapper,
   lazy,
+  startTransition,
   use,
   useCallback,
   useEffect,
@@ -32,9 +33,11 @@ import {
   useReducer,
   useRef,
   useState,
+  useTransition,
 } from "../react.ts";
 import type { Any } from "../shared.ts";
 import { createFiberDomRoot, createRoot, type ReactDomRoot } from "../react-dom-client.ts";
+import { flushSync, setFrameBudgetMs } from "../react-fiber.ts";
 import {
   asElement,
   mount,
@@ -63,9 +66,17 @@ function render(element: Any, container?: TestElement): TestElement {
   return target;
 }
 
-/** Deliver a click to an element node. */
+/**
+ * Deliver a click. The dispatch only queues what the handler causes; a test
+ * commits it by wrapping the event in `act`.
+ */
 function click(node: TestNode): void {
   asElement(node).dispatch("click", {});
+}
+
+/** Commit the work `scope` queued, the way React's `act` does. */
+function act(scope: () => void): void {
+  flushSync(scope);
 }
 
 interface Deferred<T> {
@@ -287,7 +298,7 @@ describe("reconciliation", () => {
 
     const { container, root } = fiberRoot();
     root.render(list(["a", "b"]));
-    click(container.childNodes[0].childNodes[0]);
+    act(() => click(container.childNodes[0].childNodes[0]));
     expect(container.textContent).toBe("a:1b:0");
 
     root.render(list(["b", "a"]));
@@ -309,7 +320,7 @@ describe("reconciliation", () => {
 
     const { container, root } = fiberRoot();
     root.render(list(["a", "b"]));
-    click(container.childNodes[0].childNodes[0]);
+    act(() => click(container.childNodes[0].childNodes[0]));
     expect(container.textContent).toBe("a:1b:0");
 
     // Without keys, state belongs to the slot, not to the label.
@@ -328,7 +339,7 @@ describe("reconciliation", () => {
 
     const { container, root } = fiberRoot();
     root.render(createElement(Item, { label: "a" }, "one"));
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("a:1");
 
     root.render(createElement(Item, { label: "a" }, "two"));
@@ -390,7 +401,7 @@ describe("properties and events", () => {
 
     root.render(createElement("button", { onClick: second, children: "go" }));
     expect(button.listeners.get("click")).toEqual([second]);
-    click(button);
+    act(() => click(button));
     expect(calls).toEqual(["second"]);
   });
 
@@ -405,7 +416,7 @@ describe("properties and events", () => {
     root.render(createElement("button", { onClick: listener, children: "go" }));
 
     expect(button.listeners.get("click")).toEqual([listener]);
-    click(button);
+    act(() => click(button));
     expect(calls).toEqual(["click"]);
   });
 
@@ -515,8 +526,8 @@ describe("hooks", () => {
     }
 
     const container = render(createElement(Counter, {}));
-    click(container.childNodes[0]);
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("count:2");
   });
 
@@ -537,7 +548,7 @@ describe("hooks", () => {
     expect(container.textContent).toBe("10");
     expect(initializations).toBe(1);
 
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("15");
     expect(initializations).toBe(1);
   });
@@ -558,10 +569,10 @@ describe("hooks", () => {
     const buttons = () => asElement(container.childNodes[0]).childNodes;
     expect(container.textContent).toBe("a0b100");
 
-    click(buttons()[0]);
+    act(() => click(buttons()[0]));
     expect(container.textContent).toBe("a1b100");
 
-    click(buttons()[1]);
+    act(() => click(buttons()[1]));
     expect(container.textContent).toBe("a1b101");
   });
 
@@ -586,7 +597,7 @@ describe("hooks", () => {
     expect(container.textContent).toBe("count:2 tick:0");
 
     // The commit consumed the two actions, so a later update does not replay them.
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("count:2 tick:1");
   });
 
@@ -610,7 +621,7 @@ describe("hooks", () => {
     }
 
     const container = render(createElement(Comp, {}));
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("tick:1");
     expect(updaterCalls).toBe(1);
   });
@@ -635,8 +646,8 @@ describe("hooks", () => {
     }
 
     const container = render(createElement(Comp, {}));
-    bump();
-    bump();
+    act(bump);
+    act(bump);
 
     expect(container.textContent).toBe("static");
     expect(seen).toEqual([0, 1, 2]);
@@ -668,10 +679,10 @@ describe("hooks", () => {
     expect(container.textContent).toBe("decinc10");
     expect(initializations).toBe(1);
 
-    click(container.childNodes[0].childNodes[1]);
+    act(() => click(container.childNodes[0].childNodes[1]));
     expect(container.textContent).toBe("decinc11");
 
-    click(container.childNodes[0].childNodes[0]);
+    act(() => click(container.childNodes[0].childNodes[0]));
     expect(container.textContent).toBe("decinc10");
     expect(initializations).toBe(1);
   });
@@ -959,8 +970,8 @@ describe("updates and bailouts", () => {
 
     const container = render(createElement(Parent, {}));
     const button = asElement(container.childNodes[0]);
-    click(button);
-    click(button);
+    act(() => click(button));
+    act(() => click(button));
 
     expect(container.textContent).toBe("count:2");
     expect(parentRenders).toBe(1);
@@ -997,9 +1008,9 @@ describe("updates and bailouts", () => {
     // The toggler re-renders the whole path, but Counter's element is the same
     // object and carries no lane, so Counter bails out: a clone takes its place
     // as current, and the fiber the dispatch holds becomes the alternate.
-    click(container.childNodes[0].childNodes[1]);
+    act(() => click(container.childNodes[0].childNodes[1]));
 
-    click(container.childNodes[0].childNodes[0]);
+    act(() => click(container.childNodes[0].childNodes[0]));
     expect(container.textContent).toBe("count:1on");
   });
 
@@ -1026,7 +1037,7 @@ describe("updates and bailouts", () => {
       }),
     );
 
-    click(container.childNodes[0].childNodes[0]);
+    act(() => click(container.childNodes[0].childNodes[0]));
     expect(container.textContent).toBe("first:1second");
     expect(firstRenders).toBe(2);
     expect(secondRenders).toBe(1);
@@ -1185,7 +1196,7 @@ describe("suspense", () => {
     );
     expect(container.textContent).toBe("fallback:0");
 
-    click(container.childNodes[0]);
+    act(() => click(container.childNodes[0]));
     expect(container.textContent).toBe("fallback:1");
   });
 
@@ -1210,8 +1221,8 @@ describe("suspense", () => {
     const { container, root } = fiberRoot();
     root.render(createElement(App, { suspend: false }));
     const bold = asElement(container.childNodes[0]);
-    click(bold);
-    click(bold);
+    act(() => click(bold));
+    act(() => click(bold));
     expect(container.textContent).toBe("c:2");
 
     root.render(createElement(App, { suspend: true }));
@@ -1422,6 +1433,361 @@ describe("unmount", () => {
   });
 });
 
+// ---- Concurrency -----------------------------------------------------------
+
+/**
+ * Lanes, the time-sliced work loop and `startTransition`.
+ *
+ * These tests pin the three things a lane buys the client: a transition never
+ * lands in the task that scheduled it, a concurrent render survives a slice
+ * boundary instead of starting over, and urgent work preempts it.
+ */
+describe("concurrency", () => {
+  /** The budget a slice gets in production; tests lower it to force a yield. */
+  const DEFAULT_FRAME_BUDGET_MS = 5;
+
+  afterEach(() => {
+    setFrameBudgetMs(DEFAULT_FRAME_BUDGET_MS);
+  });
+
+  it("does not commit a transition inside the task that scheduled it", async () => {
+    let setCount!: (value: number) => void;
+
+    function Counter() {
+      const [count, set] = useState(0);
+      setCount = set;
+      return createElement("b", { children: "c" + count });
+    }
+
+    const container = render(createElement(Counter, {}));
+    expect(container.textContent).toBe("c0");
+
+    startTransition(() => setCount(1));
+    // The render is its own task, so the screen still holds the old tree.
+    expect(container.textContent).toBe("c0");
+
+    await until(() => container.textContent === "c1");
+  });
+
+  it("lets an urgent update overtake a pending transition", async () => {
+    let startSlow!: () => void;
+    let setUrgent!: (value: number) => void;
+
+    function Slow() {
+      const [slow, setSlow] = useState(0);
+      startSlow = () => startTransition(() => setSlow(1));
+      return createElement("b", { children: "s" + slow });
+    }
+    function Urgent() {
+      const [urgent, set] = useState(0);
+      setUrgent = set;
+      return createElement("i", { children: "u" + urgent });
+    }
+
+    const container = render(
+      createElement("div", { children: [createElement(Slow, {}), createElement(Urgent, {})] }),
+    );
+    expect(container.textContent).toBe("s0u0");
+
+    startSlow();
+    act(() => setUrgent(1));
+
+    // The urgent update ran straight away; the transition has not rendered yet.
+    expect(container.textContent).toBe("s0u1");
+    await until(() => container.textContent === "s1u1");
+  });
+
+  it("finishes a transition that a sync update interrupted", async () => {
+    let startSlow!: () => void;
+    let setUrgent!: (value: number) => void;
+
+    function Slow() {
+      const [slow, setSlow] = useState(0);
+      startSlow = () => startTransition(() => setSlow(1));
+      return createElement("b", { children: "s" + slow });
+    }
+    function Urgent() {
+      const [urgent, set] = useState(0);
+      setUrgent = set;
+      return createElement("i", { children: "u" + urgent });
+    }
+
+    setFrameBudgetMs(0);
+    const container = render(
+      createElement("div", { children: [createElement(Slow, {}), createElement(Urgent, {})] }),
+    );
+
+    startSlow();
+    // Let the first slice run and yield; the render is now parked mid-tree.
+    await delay(0);
+    act(() => setUrgent(1));
+    expect(container.textContent).toBe("s0u1");
+
+    // The abandoned transition is scheduled again and finishes on its own.
+    await until(() => container.textContent === "s1u1");
+  });
+
+  it("renders a transition in more than one slice", async () => {
+    let showList!: () => void;
+
+    function Item({ label }: { label: string }) {
+      return createElement("i", { children: label });
+    }
+    function App() {
+      const [shown, setShown] = useState(false);
+      showList = () => startTransition(() => setShown(true));
+      const items = shown ? Array.from({ length: 30 }, (_, index) => `#${index}`) : [];
+      return createElement("div", {
+        children: items.map((label) => createElement(Item, { label })),
+      });
+    }
+
+    setFrameBudgetMs(0);
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("");
+
+    showList();
+    // One slice may run, but thirty children cannot all fit in it.
+    await delay(0);
+    expect(container.textContent).not.toBe(
+      "#0#1#2#3#4#5#6#7#8#9#10#11#12#13#14#15#16#17#18#19#20#21#22#23#24#25#26#27#28#29",
+    );
+
+    await until(
+      () =>
+        container.textContent ===
+        "#0#1#2#3#4#5#6#7#8#9#10#11#12#13#14#15#16#17#18#19#20#21#22#23#24#25#26#27#28#29",
+    );
+  });
+
+  it("reports useTransition's pending state until the work commits", async () => {
+    function App() {
+      const [isPending, start] = useTransition();
+      const [value, setValue] = useState("idle");
+      return createElement("button", {
+        onClick: () => start(() => setValue("done")),
+        children: (isPending ? "pending:" : "") + value,
+      });
+    }
+
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("idle");
+
+    act(() => click(container.childNodes[0]));
+    // Marking the component pending is urgent, so it is on screen right away.
+    expect(container.textContent).toBe("pending:idle");
+
+    await until(() => container.textContent === "done");
+  });
+
+  it("clears useTransition's flag when the scope schedules no work", () => {
+    function App() {
+      const [isPending, start] = useTransition();
+      return createElement("button", {
+        onClick: () => start(() => {}),
+        children: isPending ? "pending" : "idle",
+      });
+    }
+
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("idle");
+
+    act(() => click(container.childNodes[0]));
+    // Nothing was dispatched, so there is no lane to wait for.
+    expect(container.textContent).toBe("idle");
+  });
+
+  it("keeps content on screen when a transition suspends", async () => {
+    let resolveContent!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => {
+      resolveContent = resolve;
+    });
+    let startSwap!: () => void;
+
+    function Content({ value }: { value: Promise<string> }) {
+      return createElement("b", { children: use(value) });
+    }
+    // Already settled, so the mount has content to keep on screen.
+    const first = Promise.resolve("first") as Any;
+    first.status = "fulfilled";
+    first.value = "first";
+
+    function App() {
+      const [isPending, start] = useTransition();
+      const [value, setValue] = useState<Promise<string>>(first);
+      startSwap = () => start(() => setValue(pending));
+      return createElement("div", {
+        children: [
+          createElement("span", { children: isPending ? "pending" : "idle" }),
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "loading",
+            children: createElement(Content, { value }),
+          }),
+        ],
+      });
+    }
+
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("idlefirst");
+
+    act(startSwap);
+    // The boundary keeps the content it already shows while the transition waits.
+    expect(container.textContent).toBe("pendingfirst");
+    await delay(0);
+    expect(container.textContent).toBe("pendingfirst");
+
+    resolveContent("second");
+    await until(() => container.textContent === "idlesecond");
+  });
+
+  it("does not let a suspended transition block another one", async () => {
+    const blocked = deferred<string>();
+
+    function Slow() {
+      return createElement("b", { children: use(blocked.promise) });
+    }
+    let startFirst!: () => void;
+    let startSecond!: () => void;
+
+    function App() {
+      const [first, setFirst] = useState(false);
+      const [second, setSecond] = useState(0);
+      startFirst = () => startTransition(() => setFirst(true));
+      startSecond = () => startTransition(() => setSecond(1));
+      return createElement("div", {
+        children: [
+          createElement(REACT_SUSPENSE_TYPE, {
+            fallback: "wait",
+            children: first ? createElement(Slow, {}) : null,
+          }),
+          createElement("i", { children: "s" + second }),
+        ],
+      });
+    }
+
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("s0");
+
+    // The first transition suspends on its data.
+    startFirst();
+    await delay(0);
+    expect(container.textContent).toBe("s0");
+
+    // A transition started afterwards has its own lane, so the one that is
+    // waiting does not hold it back.
+    startSecond();
+    await until(() => container.textContent === "s1");
+
+    blocked.resolve("ready");
+    await until(() => container.textContent === "readys1");
+  });
+
+  it("keeps an async transition open until it settles", async () => {
+    const gate = deferred<void>();
+    let run!: () => void;
+
+    function App() {
+      const [isPending, start] = useTransition();
+      const [value, setValue] = useState("idle");
+      run = () =>
+        start(async () => {
+          await gate.promise;
+          // Still part of the transition, even though it runs after the await.
+          setValue("done");
+        });
+      return createElement("span", { children: (isPending ? "pending:" : "") + value });
+    }
+
+    const container = render(createElement(App, {}));
+    expect(container.textContent).toBe("idle");
+
+    act(run);
+    expect(container.textContent).toBe("pending:idle");
+
+    gate.resolve();
+    await until(() => container.textContent === "done");
+  });
+
+  it("clears useTransition's flag when the scope throws", () => {
+    function App() {
+      const [isPending, start] = useTransition();
+      return createElement("button", {
+        onClick: () => {
+          try {
+            start(() => {
+              throw new Error("boom");
+            });
+          } catch {
+            // The failure belongs to the caller, not to the transition.
+          }
+        },
+        children: isPending ? "pending" : "idle",
+      });
+    }
+
+    const container = render(createElement(App, {}));
+    act(() => click(container.childNodes[0]));
+    // Nothing was dispatched, so the flag must not stick.
+    expect(container.textContent).toBe("idle");
+  });
+
+  it("batches the updates of one event into a single render", () => {
+    let renders = 0;
+
+    function Comp() {
+      const [count, setCount] = useState(0);
+      renders++;
+      return createElement("button", {
+        onClick: () => {
+          setCount((previous) => previous + 1);
+          setCount((previous) => previous + 1);
+        },
+        children: "n" + count,
+      });
+    }
+
+    const container = render(createElement(Comp, {}));
+    expect(renders).toBe(1);
+
+    // A raw dispatch: the handler runs, but nothing renders while it does.
+    asElement(container.childNodes[0]).dispatch("click", {});
+    expect(container.textContent).toBe("n0");
+    expect(renders).toBe(1);
+
+    // The microtask that closes the task commits both actions at once.
+    act(() => {});
+    expect(container.textContent).toBe("n2");
+    expect(renders).toBe(2);
+  });
+
+  it("applies an event's updates only after the event returns", async () => {
+    let container!: TestElement;
+    let seenInsideHandler = "";
+
+    function App() {
+      const [isPending, start] = useTransition();
+      const [value, setValue] = useState("idle");
+      return createElement("button", {
+        onClick: () => {
+          start(() => setValue("done"));
+          // The pending flag is urgent, but even urgent work waits for the
+          // handler to return before it renders.
+          seenInsideHandler = container.textContent;
+        },
+        children: (isPending ? "pending:" : "") + value,
+      });
+    }
+
+    container = render(createElement(App, {}));
+    asElement(container.childNodes[0]).dispatch("click", {});
+
+    expect(seenInsideHandler).toBe("idle");
+    expect(container.textContent).toBe("idle");
+
+    await until(() => container.textContent === "done");
+  });
+});
+
 // ---- Parity with the reference client --------------------------------------
 
 describe("parity with createRoot", () => {
@@ -1462,8 +1828,8 @@ describe("parity with createRoot", () => {
       }
 
       const container = mount(createElement(Counter, {}), create);
-      click(container.childNodes[0]);
-      click(container.childNodes[0]);
+      act(() => click(container.childNodes[0]));
+      act(() => click(container.childNodes[0]));
       return shape(container);
     };
 

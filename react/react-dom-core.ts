@@ -8,6 +8,7 @@ import {
   isServerReference,
   type Dispatcher,
   type LazyWrapper,
+  type TransitionScope,
 } from "./react.ts";
 import { isThenable, type Any, type Thenable } from "./shared.ts";
 
@@ -354,6 +355,12 @@ const hookDispatcher: Dispatcher = {
   useMemo: readMemo,
   useEffect: (create, deps) => readEffect(create, deps, false),
   useLayoutEffect: (create, deps) => readEffect(create, deps, true),
+  useTransition: (): [boolean, (scope: TransitionScope) => void] => [
+    false,
+    (scope) => {
+      scope();
+    },
+  ],
 };
 
 const noop = (): void => {};
